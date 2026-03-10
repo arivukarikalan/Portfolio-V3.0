@@ -62,7 +62,6 @@ export type AppView =
   | 'admin'
   | 'target';
 const VIEW_KEY = 'fds_active_view';
-const DASH_RANGE_KEY = 'fds_dash_range';
 const DASH_TREND_RANGE_KEY = 'fds_dash_trend_range';
 const PNL_FILTER_KEY = 'fds_pnl_filters';
 const PNL_VIEW_KEY = 'fds_pnl_view';
@@ -79,10 +78,7 @@ const TARGET_FILTER_KEY = 'fds_target_filter';
 const TARGET_SORT_KEY = 'fds_target_sort';
 const GLOBAL_SEARCH_HELP =
   'Commands: dashboard, tx <symbol>, holding <symbol>, pnl, expenses, debt, insights, cloud, settings, admin, target, sync';
-type DashRange = '1W' | '1M' | '3M' | '6M' | '1Y' | 'MAX';
 type TrendRange = '7D' | '14D' | '1M';
-type TargetFilter = 'ALL' | 'APPROACHING' | 'MET';
-type TargetSort = 'PROGRESS' | 'PROFIT';
 type TargetFilter = 'ALL' | 'APPROACHING' | 'MET';
 type TargetSort = 'PROGRESS' | 'PROFIT';
 type PnlFilterMode = 'ALL' | 'WINNERS' | 'LOSERS';
@@ -398,18 +394,6 @@ function resolveGlobalSearch(raw: string): { view?: AppView; store?: string; toa
   return { toast: GLOBAL_SEARCH_HELP };
 }
 
-function getDashRange(): DashRange {
-  const raw = String(localStorage.getItem(DASH_RANGE_KEY) || '').trim().toUpperCase();
-  if (raw === '1W' || raw === '1M' || raw === '3M' || raw === '6M' || raw === '1Y' || raw === 'MAX') {
-    return raw;
-  }
-  return '3M';
-}
-
-function setDashRange(value: DashRange): void {
-  localStorage.setItem(DASH_RANGE_KEY, value);
-}
-
 function getTrendRange(): TrendRange {
   const raw = String(localStorage.getItem(DASH_TREND_RANGE_KEY) || '').trim().toUpperCase();
   if (raw === '7D' || raw === '14D' || raw === '1M') return raw;
@@ -438,53 +422,6 @@ function getTargetSort(): TargetSort {
 
 function setTargetSort(value: TargetSort): void {
   localStorage.setItem(TARGET_SORT_KEY, value);
-}
-
-function buildContributionSeries(state: AppState, range: DashRange): Array<{ date: string; cumulative: number; daily: number }> {
-  const sorted = sortTransactionsChronologically(state.transactions, 'asc');
-  if (!sorted.length) return [];
-
-  const byDate = new Map<string, number>();
-  for (const txn of sorted) {
-    const date = String(txn.tradeDate || '').trim();
-    if (!date) continue;
-    const gross = Number(txn.quantity || 0) * Number(txn.price || 0);
-    const fees = Number(txn.fees || 0);
-    const impact = txn.side === 'BUY' ? gross + fees : -(gross - fees);
-    byDate.set(date, Number(byDate.get(date) || 0) + impact);
-  }
-
-  let dates = Array.from(byDate.keys()).sort();
-  if (!dates.length) return [];
-
-  const lastDate = new Date(dates[dates.length - 1]).getTime();
-  const spanDays =
-    range === '1W' ? 7 :
-    range === '1M' ? 30 :
-    range === '3M' ? 90 :
-    range === '6M' ? 180 :
-    range === '1Y' ? 365 : 3650;
-  if (range !== 'MAX' && Number.isFinite(lastDate)) {
-    const minDate = lastDate - spanDays * 24 * 60 * 60 * 1000;
-    dates = dates.filter((d) => {
-      const ts = new Date(d).getTime();
-      return Number.isFinite(ts) && ts >= minDate;
-    });
-  }
-
-  const rows: Array<{ date: string; cumulative: number; daily: number }> = [];
-  let running = 0;
-  const allDates = Array.from(byDate.keys()).sort();
-  for (const d of allDates) {
-    running += Number(byDate.get(d) || 0);
-    if (!dates.includes(d)) continue;
-    rows.push({
-      date: d,
-      daily: Number(byDate.get(d) || 0),
-      cumulative: Math.max(0, running)
-    });
-  }
-  return rows;
 }
 
 function buildSparkline(values: number[]): {
@@ -674,7 +611,7 @@ function formatDateCompact(isoDate: string): string {
   return `${String(dt.getDate()).padStart(2, '0')} ${months[dt.getMonth()]}`;
 }
 
-function renderDashboardHome(state: AppState, range: DashRange): string {
+function renderDashboardHome(state: AppState): string {
   const trendRange = getTrendRange();
   const trendLabel = trendRange;
   const trendButtons = ['7D', '14D', '1M']
@@ -1591,30 +1528,6 @@ function renderAuth(root: HTMLElement, mode: 'login' | 'register', message = '',
       hideBlockingLoader();
     }
   });
-}
-
-function pendingRowsMarkup(rows: PendingRequest[]): string {
-  if (rows.length === 0) {
-    return '<tr><td colspan="6">No pending requests</td></tr>';
-  }
-
-  return rows
-    .map((row) => {
-      return `
-        <tr>
-          <td>${esc(row.requestId)}</td>
-          <td>${esc(row.name)}</td>
-          <td>${esc(row.loginId)}</td>
-          <td>${esc(row.email || '')}</td>
-          <td>${esc(row.requestedAt)}</td>
-          <td>
-            <button class="mini" data-action="approve" data-id="${esc(row.requestId)}">Approve</button>
-            <button class="mini ghost" data-action="reject" data-id="${esc(row.requestId)}">Reject</button>
-          </td>
-        </tr>
-      `;
-    })
-    .join('');
 }
 
 function transactionCards(state: AppState, currency: string): string {
@@ -2991,7 +2904,7 @@ function money(value: number, currency: string): string {
 }
 
 function mergeExpenseDebtRows(state: AppState): Array<{
-  type: 'EXPENSE' | 'DEBT';
+  type: 'EXPENSE' | 'DEBT' | 'CREDIT';
   date: string;
   label: string;
   amount: number;
@@ -3514,10 +3427,9 @@ function renderExitAnalysis(
 
 function renderPageContent(view: AppView, session: UserSession, state: AppState): string {
   const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
-  const dashRange = getDashRange();
 
   if (view === 'dashboard') {
-    return renderDashboardHome(state, dashRange);
+    return renderDashboardHome(state);
   }
 
   if (view === 'transactions') {
@@ -3809,7 +3721,7 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           <div class="smart-exit-summary">
             <div>
               <div class="tiny-label">Profit Potential</div>
-              <strong class="${selectedCapital?.returnPct >= 0 ? 'profit' : 'loss'}">
+              <strong class="${(selectedCapital?.returnPct ?? 0) >= 0 ? 'profit' : 'loss'}">
                 ${selectedCapital ? `${selectedCapital.returnPct.toFixed(2)}%` : '--'}
               </strong>
               <div class="tiny-label">
@@ -4148,7 +4060,6 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
     const currency = state.settings.currency;
     const portfolioSize = Number(state.settings.portfolioSize || 0);
     const monthlyBudget = Number(state.settings.monthlyBudget || 0);
-    const stockBudget = Number(state.settings.stockBudget || 0);
     const maxAllocationRaw = Number(state.settings.allocationLimitPct);
     const maxAllocationPct = Number.isFinite(maxAllocationRaw) ? maxAllocationRaw : 0;
     const maxAllocationAmt = (portfolioSize * maxAllocationPct) / 100;
@@ -4156,12 +4067,9 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
     const l2Dip = Number(state.settings.l2DipPct || 0);
     const sellTarget = Number(state.settings.sellTargetPct || 0);
     const stopLoss = Number(state.settings.stopLossPct || 0);
-    const minHold = Number(state.settings.minHoldDaysTrim || 0);
     const buyBrokerage = Number(state.settings.brokerageBuyPct || 0);
     const sellBrokerage = Number(state.settings.brokerageSellPct || 0);
     const dpCharge = Number(state.settings.dpCharge || 0);
-    const fdRate = Number(state.settings.fdRatePct || 0);
-    const inflation = Number(state.settings.inflationRatePct || 0);
     const liveRefresh = Number(state.settings.livePriceRefreshSec || 0);
     const healthTone =
       stopLoss >= 12 || maxAllocationPct >= 20 ? 'risk' : stopLoss >= 8 || maxAllocationPct >= 15 ? 'warn' : 'ok';
@@ -6219,7 +6127,6 @@ function renderWorkspace(
       const to = String(dateTo?.value || '').trim();
       const filtered = tableRows.filter((row) => {
         const kind = String(row.dataset.kind || '');
-        const subtype = String(row.dataset.subtype || '');
         const date = String(row.dataset.date || '');
         if (activeChip === 'expense' && kind !== 'EXPENSE') return false;
         if (activeChip === 'debt' && kind !== 'DEBT') return false;

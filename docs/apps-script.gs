@@ -1,4 +1,4 @@
-const SPREADSHEET_ID = '1pbSOF0A-RBkO86RM3sSEWx3rIdnljP1AyjJZ1ImW9Eo';
+const SPREADSHEET_ID = getSpreadsheetId();
 const USERS_SHEET = 'Users';
 const PENDING_USERS_SHEET = 'PendingUsers';
 const SNAPSHOTS_SHEET = 'Snapshots';
@@ -908,6 +908,12 @@ function getSheet(sheetName, headers) {
   }
 
   return sheet;
+}
+
+function getSpreadsheetId() {
+  const prop = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (prop && String(prop).trim()) return String(prop).trim();
+  throw new Error('Missing SPREADSHEET_ID in Script Properties');
 }
 
 function nowIso() {

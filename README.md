@@ -30,7 +30,7 @@ npm run preview
 App uses one fixed script URL for all users.
 
 Configured values:
-- Spreadsheet ID: `1pbSOF0A-RBkO86RM3sSEWx3rIdnljP1AyjJZ1ImW9Eo`
+- Spreadsheet ID: stored in Apps Script Properties (private)
 - Web App URL: `https://script.google.com/macros/s/AKfycbzQrRH_salSv5B1dQExYZbOJfKU9denSIcJ8Edk44UOXRMVHIAkw2E-NKr1vxXbFDdI/exec`
 
 Current API contract:
@@ -43,9 +43,10 @@ Current API contract:
 - `GET` pull snapshot: `?mode=pull&userId=<id>`
 
 ## Admin/User login setup (zero cost)
-1. Open Google Sheets with ID `1pbSOF0A-RBkO86RM3sSEWx3rIdnljP1AyjJZ1ImW9Eo`.
+1. Open your Google Sheet (Spreadsheet ID is kept private in Apps Script Properties).
 2. Open `Extensions -> Apps Script`.
 3. Copy-paste [docs/apps-script.gs](docs/apps-script.gs) into script editor and save.
+4. In **Project Settings** → **Script Properties**, add `SPREADSHEET_ID` with your Google Sheet ID.
 4. Deploy as Web App:
    - Execute as: `Me`
    - Who has access: `Anyone`
