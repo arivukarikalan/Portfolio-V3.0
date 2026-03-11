@@ -620,6 +620,7 @@ function renderDashboardHome(state: AppState): string {
         `<button type="button" class="mini ${trendRange === item ? '' : 'ghost'}" data-trend-range="${item}">${item}</button>`
     )
     .join('');
+  const mobileTrendButtons = `<button type="button" class="mini" data-mobile-trend="7D">7D</button>`;
   const snapshot = dashboardFromState(state);
   const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
   const invested = holdings.reduce((sum, h) => sum + Number(h.invested || 0), 0);
@@ -706,8 +707,11 @@ function renderDashboardHome(state: AppState): string {
         <section class="panel perf-panel">
           <div class="insight-section-head">
             <h2>Daily P/L (${trendLabel})</h2>
-            <div class="dash-range trend-range">
+            <div class="dash-range trend-range desktop-only">
               ${trendButtons}
+            </div>
+            <div class="dash-range trend-range mobile-only">
+              ${mobileTrendButtons}
             </div>
           </div>
           <div class="perf-chart" id="daily-pnl-chart">
@@ -716,7 +720,7 @@ function renderDashboardHome(state: AppState): string {
           <p class="muted">Based on recent trading-day prices for top holdings.</p>
         </section>
 
-        <section class="panel pnl-trend-panel">
+        <section class="panel pnl-trend-panel desktop-only">
           <div class="insight-section-head">
             <h2>Realized vs Unrealized (${trendLabel})</h2>
             <div class="dash-range trend-range">
@@ -751,6 +755,27 @@ function renderDashboardHome(state: AppState): string {
                   .join('') || '<p class="muted">No holdings available.</p>'
               }
             </div>
+          </div>
+          <div class="allocation-mobile">
+            ${
+              topAlloc.length
+                ? topAlloc
+                    .map(
+                      (row, idx) => `
+                  <div class="allocation-mobile-row">
+                    <div class="allocation-mobile-head">
+                      <span>${esc(row.stock)}</span>
+                      <strong>${row.share.toFixed(1)}%</strong>
+                    </div>
+                    <div class="allocation-mobile-bar">
+                      <i style="width:${Math.max(6, row.share).toFixed(2)}%; background:${DASH_COLORS[idx % DASH_COLORS.length]}"></i>
+                    </div>
+                  </div>
+                `
+                    )
+                    .join('')
+                : '<p class="muted">No holdings available.</p>'
+            }
           </div>
         </section>
 
@@ -845,8 +870,17 @@ function bindDailyPnlTooltip(container: HTMLElement, currency: string): void {
     tooltip.innerHTML = `<strong>${esc(formatDateReadable(date))}</strong><span>${formatCurrency(value, currency)}</span>`;
     tooltip.classList.remove('hidden');
     const rect = point.getBoundingClientRect();
-    tooltip.style.left = `${rect.left + rect.width / 2}px`;
-    tooltip.style.top = `${rect.top - 12}px`;
+    const containerRect = container.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const midX = rect.left + rect.width / 2;
+    const halfWidth = tooltipRect.width / 2;
+    const minX = containerRect.left + halfWidth + 8;
+    const maxX = containerRect.right - halfWidth - 8;
+    const clampedX = Math.min(maxX, Math.max(minX, midX));
+    const minTop = containerRect.top + tooltipRect.height + 8;
+    const top = Math.max(minTop, rect.top - 12);
+    tooltip.style.left = `${clampedX}px`;
+    tooltip.style.top = `${top}px`;
   };
 
   const hide = (): void => {
@@ -875,8 +909,17 @@ function bindPnlSplitTooltip(container: HTMLElement, currency: string): void {
     `;
     tooltip.classList.remove('hidden');
     const rect = point.getBoundingClientRect();
-    tooltip.style.left = `${rect.left + rect.width / 2}px`;
-    tooltip.style.top = `${rect.top - 12}px`;
+    const containerRect = container.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const midX = rect.left + rect.width / 2;
+    const halfWidth = tooltipRect.width / 2;
+    const minX = containerRect.left + halfWidth + 8;
+    const maxX = containerRect.right - halfWidth - 8;
+    const clampedX = Math.min(maxX, Math.max(minX, midX));
+    const minTop = containerRect.top + tooltipRect.height + 8;
+    const top = Math.max(minTop, rect.top - 12);
+    tooltip.style.left = `${clampedX}px`;
+    tooltip.style.top = `${top}px`;
   };
 
   const hide = (): void => {
@@ -1232,7 +1275,7 @@ type UiPrefs = {
 function loadUiPrefs(): UiPrefs {
   const raw = String(localStorage.getItem(UI_PREFS_KEY) || '').trim();
   if (!raw) {
-    return { fontScale: 1, compact: false, reduceMotion: false, softBackground: true, theme: 'light' };
+    return { fontScale: 1, compact: true, reduceMotion: false, softBackground: true, theme: 'light' };
   }
   try {
     const parsed = JSON.parse(raw) as Partial<UiPrefs>;
@@ -1245,7 +1288,7 @@ function loadUiPrefs(): UiPrefs {
       theme: parsed.theme === 'dark' ? 'dark' : 'light'
     };
   } catch {
-    return { fontScale: 1, compact: false, reduceMotion: false, softBackground: true, theme: 'light' };
+    return { fontScale: 1, compact: true, reduceMotion: false, softBackground: true, theme: 'light' };
   }
 }
 
@@ -1868,7 +1911,7 @@ function computeTxnFees(
 }
 
 function pnlRows(rows: RealizedPnlRow[], currency: string, emptyMessage = 'No realized SELL trades yet.'): string {
-  if (!rows.length) return `<tr><td colspan="9">${esc(emptyMessage)}</td></tr>`;
+  if (!rows.length) return `<tr class="pnl-empty-row"><td colspan="9">${esc(emptyMessage)}</td></tr>`;
 
   return rows
     .slice(0, 200)
@@ -1876,15 +1919,15 @@ function pnlRows(rows: RealizedPnlRow[], currency: string, emptyMessage = 'No re
       const cls = row.net >= 0 ? 'profit' : 'loss';
       return `
         <tr>
-          <td>${formatDateFromISOToDDMM(row.date)}</td>
-          <td>${esc(row.stock)}</td>
-          <td>${row.quantity.toFixed(2)}</td>
-          <td>${formatCurrency(row.buyCost + row.buyFees, currency)}</td>
-          <td>${formatCurrency(row.sellValue, currency)}</td>
-          <td>${formatCurrency(row.sellFees, currency)}</td>
-          <td class="${cls}">${formatCurrency(row.net, currency)}</td>
-          <td>${row.holdDays.toFixed(0)}d</td>
-          <td class="${cls}">${row.returnPct.toFixed(2)}%</td>
+          <td data-label="Date">${formatDateFromISOToDDMM(row.date)}</td>
+          <td data-label="Stock">${esc(row.stock)}</td>
+          <td data-label="Qty">${row.quantity.toFixed(2)}</td>
+          <td data-label="Invested">${formatCurrency(row.buyCost + row.buyFees, currency)}</td>
+          <td data-label="Sell Value">${formatCurrency(row.sellValue, currency)}</td>
+          <td data-label="Sell Fees">${formatCurrency(row.sellFees, currency)}</td>
+          <td data-label="Net" class="${cls}">${formatCurrency(row.net, currency)}</td>
+          <td data-label="Hold">${row.holdDays.toFixed(0)}d</td>
+          <td data-label="Return" class="${cls}">${row.returnPct.toFixed(2)}%</td>
         </tr>
       `;
     })
@@ -2009,8 +2052,6 @@ function buildPnlStudio(state: AppState): string {
   if (!rows.length && viewMode === 'REALIZED') {
     return `
       <section class="panel">
-        <h2>Profit & Loss Studio</h2>
-        <p class="muted">Analyze your realized outcomes stock-wise, spot trends, and deep dive into each sell transaction.</p>
         <div class="txn-empty">No realized SELL trades yet. Add/import sells to unlock P/L analytics.</div>
       </section>
     `;
@@ -2088,11 +2129,6 @@ function buildPnlStudio(state: AppState): string {
 
   return `
     <section class="panel pnl-studio">
-      <div class="pnl-header">
-        <h2>Profit & Loss Studio</h2>
-        <p class="muted">Analyze your realized outcomes stock-wise, spot trends, and deep dive into each sell transaction.</p>
-      </div>
-
       <section class="pnl-main-grid pnl-filter-top">
         <article class="panel pnl-filter-shell" data-min-date="${allRange.from}" data-max-date="${allRange.to}">
           <div class="pnl-filter-toprow">
@@ -2316,7 +2352,7 @@ function buildPnlStudio(state: AppState): string {
           ${
             viewMode === 'REALIZED'
               ? `
-          <table>
+          <table class="pnl-table">
             <thead>
               <tr><th>Date</th><th>Stock</th><th>Qty</th><th>Invested</th><th>Sell Value</th><th>Sell Fees</th><th>Net</th><th>Hold Days</th><th>Return</th></tr>
             </thead>
@@ -2387,17 +2423,17 @@ function buildPnlStudio(state: AppState): string {
 
 function mappingRows(state: AppState): string {
   if (!state.stockMappings.length) {
-    return '<tr><td colspan="4">No mappings yet.</td></tr>';
+    return '<tr class="mapping-empty-row"><td colspan="4">No mappings yet.</td></tr>';
   }
 
   return state.stockMappings
     .map(
       (row) => `
     <tr>
-      <td>${esc(row.stock)}</td>
-      <td>${esc(row.ticker)}</td>
-      <td>${row.enabled ? 'Enabled' : 'Disabled'}</td>
-      <td>
+      <td data-label="Stock">${esc(row.stock)}</td>
+      <td data-label="Ticker">${esc(row.ticker)}</td>
+      <td data-label="Status">${row.enabled ? 'Enabled' : 'Disabled'}</td>
+      <td data-label="Action">
         <button type="button" class="mini" data-edit-mapping="${esc(row.stock)}">Edit</button>
         <button type="button" class="mini ghost" data-del-mapping="${esc(row.stock)}">Delete</button>
       </td>
@@ -2596,11 +2632,6 @@ function renderTargetPlanner(state: AppState): string {
 
   return `
     <section class="target-planner">
-      <div class="target-hero">
-        <h2>Target Planner</h2>
-        <p class="muted">Track progress of your investment targets calculated from strategy rules.</p>
-      </div>
-
       <section class="target-kpi-grid">
         <article class="panel target-kpi-card">
           <span>Total Invested</span>
@@ -3018,12 +3049,6 @@ function renderExpenseDebtTransactions(state: AppState): string {
 
   return `
     <section class="txned-layout">
-      <section class="panel txned-header">
-        <div>
-          <p class="muted">Track income, expenses, investments & debts</p>
-        </div>
-      </section>
-
       <section class="txned-kpis">
         <article class="txned-kpi-card">
           <span>Expenses</span>
@@ -3187,7 +3212,7 @@ function renderExpenseDebtTransactions(state: AppState): string {
           </div>
         </div>
         <div class="table-wrap">
-          <table>
+          <table class="txned-table">
             <thead>
               <tr><th>Date</th><th>Type</th><th>Category</th><th>Amount</th><th>Payment</th><th>Note</th><th>Action</th></tr>
             </thead>
@@ -3205,13 +3230,13 @@ function renderExpenseDebtTransactions(state: AppState): string {
                                 ? 'Repay'
                                 : 'Debt';
                         return `<tr data-kind="${row.type}" data-subtype="${esc(row.meta)}" data-date="${esc(row.date)}" data-label="${esc(row.label)}">
-                          <td>${formatDateFromISOToDDMM(row.date)}</td>
-                          <td>${typeLabel}</td>
-                          <td>${esc(row.category || row.label)}</td>
-                          <td>${money(row.amount, state.settings.currency)}</td>
-                          <td>${esc(row.payment || '-') }</td>
-                          <td>${esc(row.note || '-') }</td>
-                          <td>
+                          <td data-label="Date">${formatDateFromISOToDDMM(row.date)}</td>
+                          <td data-label="Type">${typeLabel}</td>
+                          <td data-label="Category">${esc(row.category || row.label)}</td>
+                          <td data-label="Amount">${money(row.amount, state.settings.currency)}</td>
+                          <td data-label="Payment">${esc(row.payment || '-') }</td>
+                          <td data-label="Note">${esc(row.note || '-') }</td>
+                          <td data-label="Action">
                             ${
                               row.type === 'EXPENSE'
                                 ? `<button type="button" class="mini" data-edit-expense="${esc(row.id)}">Edit</button>
@@ -3226,7 +3251,7 @@ function renderExpenseDebtTransactions(state: AppState): string {
                         </tr>`;
                       })
                       .join('')
-                  : '<tr><td colspan="7">No entries yet.</td></tr>'
+                  : '<tr class="txned-empty-row"><td colspan="7">No entries yet.</td></tr>'
               }
             </tbody>
           </table>
@@ -3264,12 +3289,6 @@ function renderExpenseDebtDashboard(state: AppState): string {
 
   return `
     <section class="edash-layout">
-      <section class="panel edash-header">
-        <div>
-          <p class="muted">Overview of expenses, debts, and credits.</p>
-        </div>
-      </section>
-
       <section class="edash-kpis">
         <article class="edash-kpi-card">
           <span>Expenses</span>
@@ -3481,7 +3500,7 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           <button type="submit">Save Mapping</button>
         </form>
         <div class="table-wrap">
-          <table>
+          <table class="mapping-table">
             <thead><tr><th>Stock</th><th>Ticker</th><th>Status</th><th>Action</th></tr></thead>
             <tbody>${mappingRows(state)}</tbody>
           </table>
@@ -4493,11 +4512,19 @@ function renderWorkspace(
       </aside>
 
       <section class="content">
+        <header class="mobile-header">
+          <button id="mobile-menu-btn" type="button" class="mobile-icon-btn" aria-label="Open menu">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/>
+            </svg>
+          </button>
+          <button id="mobile-logo-btn" type="button" class="mobile-logo-btn">${APP_NAME}</button>
+          <button id="mobile-profile-btn" type="button" class="mobile-icon-btn" aria-label="Profile">${session.name.slice(0, 1).toUpperCase()}</button>
+        </header>
         <header class="topbar">
           <div class="topbar-title">
             <h1>${viewLabel(effectiveView)}</h1>
             <p>${session.name} | Role: ${session.role}</p>
-            <div class="topbar-sync"><span>Next Live Price Sync</span><strong data-live-sync-countdown>--</strong></div>
           </div>
           <div class="topbar-search">
             <form id="global-search-form" class="topbar-search-form">
@@ -4621,6 +4648,68 @@ function renderWorkspace(
           </div>
         </div>
       </div>
+        <nav class="mobile-bottom-nav">
+          <a class="${view === 'dashboard' ? 'active' : ''}" href="${pagePath('dashboard')}" aria-label="Dashboard">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.5 10.5 12 4l8.5 6.5V20a1 1 0 0 1-1 1h-5v-6h-5v6h-5a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">Dashboard</span>
+          </a>
+          <a class="${view === 'transactions' ? 'active' : ''}" href="${pagePath('transactions')}" aria-label="Trades">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h13m0 0-3-3m3 3-3 3M20 17H7m0 0 3 3m-3-3 3-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">Trades</span>
+          </a>
+          <a class="${view === 'holdings' ? 'active' : ''}" href="${pagePath('holdings')}" aria-label="Holdings">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 19V5m0 14h16M8 17v-6m4 6V7m4 10v-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">Holdings</span>
+          </a>
+          <a class="${view === 'insights' ? 'active' : ''}" href="${pagePath('insights')}" aria-label="Insights">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M9 18h6m-7-3h8m-6.5-2.5c-2.2-1.3-3.2-4.4-1.2-6.5a4.5 4.5 0 0 1 6.4 0c2 2.1 1 5.2-1.2 6.5L13 14h-2z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">Insights</span>
+          </a>
+          <button id="mobile-more-btn" type="button" aria-label="More">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 12h.01M12 12h.01M18 12h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">More</span>
+          </button>
+        </nav>
+      </section>
+
+      <div id="mobile-drawer" class="mobile-drawer" aria-hidden="true">
+        <div class="mobile-drawer-panel">
+          <div class="mobile-drawer-head">
+            <strong>${APP_NAME}</strong>
+            <button id="mobile-drawer-close" type="button" class="ghost mini">Close</button>
+          </div>
+          <nav class="mobile-drawer-nav">
+            ${menuItems
+              .map(
+                (item) => `<a class="menu-item ${view === item.view ? 'active' : ''}" href="${pagePath(item.view)}">
+                  <span class="menu-icon">${item.icon}</span>
+                  <span>${item.label}</span>
+                </a>`
+              )
+              .join('')}
+          </nav>
+        </div>
+      </div>
     </main>
   `;
 
@@ -4640,15 +4729,44 @@ function renderWorkspace(
     showToast('Logged out', 'info');
     bootstrapApp(root);
   });
+  const isMobile = window.matchMedia('(max-width: 768px)').matches;
+  if (isMobile) {
+    const drawer = root.querySelector<HTMLElement>('#mobile-drawer');
+    let lastDrawerTrigger: HTMLElement | null = null;
+    drawer?.setAttribute('inert', '');
+    const openDrawer = (): void => {
+      if (!drawer) return;
+      drawer.classList.add('open');
+      drawer.removeAttribute('inert');
+      drawer.setAttribute('aria-hidden', 'false');
+    };
+    const closeDrawer = (): void => {
+      if (!drawer) return;
+      if (drawer.contains(document.activeElement)) {
+        (lastDrawerTrigger ?? root.querySelector<HTMLElement>('#mobile-menu-btn') ?? document.body).focus();
+      }
+      drawer.classList.remove('open');
+      drawer.setAttribute('aria-hidden', 'true');
+      drawer.setAttribute('inert', '');
+    };
+    const handleOpenDrawer = (event: Event): void => {
+      lastDrawerTrigger = event.currentTarget as HTMLElement | null;
+      openDrawer();
+    };
+    root.querySelector<HTMLButtonElement>('#mobile-menu-btn')?.addEventListener('click', handleOpenDrawer);
+    root.querySelector<HTMLButtonElement>('#mobile-more-btn')?.addEventListener('click', handleOpenDrawer);
+    root.querySelector<HTMLButtonElement>('#mobile-drawer-close')?.addEventListener('click', closeDrawer);
+    drawer?.addEventListener('click', (event) => {
+      if (event.target === drawer) closeDrawer();
+    });
+
+  }
 
   const profileBtn = root.querySelector<HTMLButtonElement>('#profile-menu-btn');
   const profileMenu = root.querySelector<HTMLDivElement>('#profile-menu');
-  profileBtn?.addEventListener('click', () => {
-    profileMenu?.classList.remove('open');
-    openUiModal();
-  });
-
   const uiModal = root.querySelector<HTMLElement>('#ui-settings-modal');
+  let lastUiTrigger: HTMLElement | null = null;
+  uiModal?.setAttribute('inert', '');
   const uiCloseBtn = root.querySelector<HTMLButtonElement>('#close-ui-settings');
   const logoBtn = root.querySelector<HTMLButtonElement>('#app-logo-btn');
   const fontScaleInput = root.querySelector<HTMLInputElement>('#ui-font-scale');
@@ -4698,18 +4816,32 @@ function renderWorkspace(
     });
   });
 
-  const openUiModal = (): void => {
+  const openUiModal = (trigger?: HTMLElement | null): void => {
     if (!uiModal) return;
+    if (trigger) lastUiTrigger = trigger;
     uiModal.classList.add('open');
     uiModal.setAttribute('aria-hidden', 'false');
+    uiModal.removeAttribute('inert');
   };
   const closeUiModal = (): void => {
     if (!uiModal) return;
+    if (uiModal.contains(document.activeElement)) {
+      (lastUiTrigger ?? document.body).focus();
+    }
     uiModal.classList.remove('open');
     uiModal.setAttribute('aria-hidden', 'true');
+    uiModal.setAttribute('inert', '');
   };
 
-  logoBtn?.addEventListener('click', openUiModal);
+  const handleOpenUiModal = (event: Event): void => {
+    openUiModal(event.currentTarget as HTMLElement | null);
+  };
+  profileBtn?.addEventListener('click', (event) => {
+    profileMenu?.classList.remove('open');
+    handleOpenUiModal(event);
+  });
+  logoBtn?.addEventListener('click', handleOpenUiModal);
+  root.querySelector<HTMLButtonElement>('#mobile-profile-btn')?.addEventListener('click', handleOpenUiModal);
   uiCloseBtn?.addEventListener('click', closeUiModal);
   uiModal?.addEventListener('click', (event) => {
     if (event.target === uiModal) closeUiModal();
@@ -4734,6 +4866,12 @@ function renderWorkspace(
     }
     showToast(GLOBAL_SEARCH_HELP, 'info');
   });
+
+  if (viewKey === 'dashboard' && window.matchMedia('(max-width: 768px)').matches) {
+    if (getTrendRange() !== '7D') {
+      setTrendRange('7D');
+    }
+  }
 
   bindGlobalShortcuts(root);
 
@@ -4870,6 +5008,13 @@ function renderWorkspace(
         const next = String(btn.dataset.trendRange || '').trim().toUpperCase() as TrendRange;
         if (!next || next === getTrendRange()) return;
         setTrendRange(next);
+        renderWorkspace(root, session, state, view);
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>('button[data-mobile-trend]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        if (getTrendRange() === '7D') return;
+        setTrendRange('7D');
         renderWorkspace(root, session, state, view);
       });
     });
