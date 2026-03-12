@@ -531,13 +531,17 @@ function resolveTickerFromRegistry(
 
   const rawTokens = tokenizeCompanyText(raw);
   const rawAcronym = buildAcronym(raw);
-  let best: { ticker: string; score: number; matchedBy: string } | null = null;
+  let bestTicker = '';
+  let bestScore = -1;
+  let bestMatchedBy = '';
 
   registry.forEach((item) => {
     const ticker = String(item.ticker || '').trim().toUpperCase();
     if (!ticker) return;
     if (raw === ticker) {
-      best = { ticker, score: 1, matchedBy: 'exact' };
+      bestTicker = ticker;
+      bestScore = 1;
+      bestMatchedBy = 'exact';
       return;
     }
     const synonyms = Array.isArray(item.synonyms) ? item.synonyms : [];
@@ -545,7 +549,11 @@ function resolveTickerFromRegistry(
       const synText = String(syn || '').trim().toUpperCase();
       if (!synText) continue;
       if (synText === raw) {
-        if (!best || best.score < 0.98) best = { ticker, score: 0.98, matchedBy: 'synonym' };
+        if (bestScore < 0.98) {
+          bestTicker = ticker;
+          bestScore = 0.98;
+          bestMatchedBy = 'synonym';
+        }
         return;
       }
     }
@@ -553,18 +561,24 @@ function resolveTickerFromRegistry(
     const synTokens = synonyms.flatMap((syn) => tokenizeCompanyText(syn));
     const combinedTokens = Array.from(new Set([...tickerTokens, ...synTokens]));
     const tokenScore = scoreTokenOverlap(rawTokens, combinedTokens);
-    if (tokenScore > 0.74 && (!best || tokenScore > (best?.score ?? -1))) {
-      best = { ticker, score: tokenScore, matchedBy: 'partial' };
+    if (tokenScore > 0.74 && tokenScore > bestScore) {
+      bestTicker = ticker;
+      bestScore = tokenScore;
+      bestMatchedBy = 'partial';
     }
-    if (rawAcronym && rawAcronym === ticker && (!best || (best?.score ?? -1) < 0.8)) {
-      best = { ticker, score: 0.8, matchedBy: 'acronym' };
+    if (rawAcronym && rawAcronym === ticker && bestScore < 0.8) {
+      bestTicker = ticker;
+      bestScore = 0.8;
+      bestMatchedBy = 'acronym';
     }
-    if (raw.includes(ticker) && ticker.length <= 6 && (!best || (best?.score ?? -1) < 0.76)) {
-      best = { ticker, score: 0.76, matchedBy: 'contains' };
+    if (raw.includes(ticker) && ticker.length <= 6 && bestScore < 0.76) {
+      bestTicker = ticker;
+      bestScore = 0.76;
+      bestMatchedBy = 'contains';
     }
   });
 
-  return best && best.score >= 0.75 ? best : null;
+  return bestScore >= 0.75 ? { ticker: bestTicker, score: bestScore, matchedBy: bestMatchedBy } : null;
 }
 
 function resolveTickerFromNseMaster(
@@ -578,7 +592,9 @@ function resolveTickerFromNseMaster(
   const rawTokens = tokenizeCompanyText(raw);
   const rawCompact = normalizeCompanyText(raw).replaceAll(' ', '');
   const rawNormalized = normalizeCompanyText(raw);
-  let best: { ticker: string; score: number; matchedBy: string } | null = null;
+  let bestTicker = '';
+  let bestScore = -1;
+  let bestMatchedBy = '';
 
   nseMaster.forEach((row) => {
     const symbolKey = String(row.symbol || '').trim().toUpperCase();
@@ -586,34 +602,46 @@ function resolveTickerFromNseMaster(
     const isinKey = String(row.isin || '').trim().toUpperCase();
     if (!symbolKey) return;
     if (raw === symbolKey) {
-      best = { ticker: symbolKey, score: 1, matchedBy: 'nse_symbol' };
+      bestTicker = symbolKey;
+      bestScore = 1;
+      bestMatchedBy = 'nse_symbol';
       return;
     }
     if (isinKey && raw === isinKey) {
-      best = { ticker: symbolKey, score: 0.99, matchedBy: 'nse_isin' };
+      bestTicker = symbolKey;
+      bestScore = 0.99;
+      bestMatchedBy = 'nse_isin';
       return;
     }
     if (nameKey && raw === nameKey) {
-      best = { ticker: symbolKey, score: 0.98, matchedBy: 'nse_name' };
+      bestTicker = symbolKey;
+      bestScore = 0.98;
+      bestMatchedBy = 'nse_name';
       return;
     }
     const nameNormalized = normalizeCompanyText(nameKey);
     if (rawNormalized && nameNormalized && rawNormalized === nameNormalized) {
-      best = { ticker: symbolKey, score: 0.97, matchedBy: 'nse_name_normalized' };
+      bestTicker = symbolKey;
+      bestScore = 0.97;
+      bestMatchedBy = 'nse_name_normalized';
       return;
     }
     const nameTokens = tokenizeCompanyText(nameKey);
     const score = scoreTokenOverlap(rawTokens, nameTokens);
-    if (score > 0.55 && (!best || score > (best?.score ?? -1))) {
-      best = { ticker: symbolKey, score, matchedBy: 'nse_partial' };
+    if (score > 0.55 && score > bestScore) {
+      bestTicker = symbolKey;
+      bestScore = score;
+      bestMatchedBy = 'nse_partial';
     }
     const nameCompact = normalizeCompanyText(nameKey).replaceAll(' ', '');
-    if (rawCompact && nameCompact && nameCompact.includes(rawCompact) && (!best || (best?.score ?? -1) < 0.7)) {
-      best = { ticker: symbolKey, score: 0.7, matchedBy: 'nse_contains' };
+    if (rawCompact && nameCompact && nameCompact.includes(rawCompact) && bestScore < 0.7) {
+      bestTicker = symbolKey;
+      bestScore = 0.7;
+      bestMatchedBy = 'nse_contains';
     }
   });
 
-  return best;
+  return bestScore >= 0 ? { ticker: bestTicker, score: bestScore, matchedBy: bestMatchedBy } : null;
 }
 
 async function refreshTickerData(session: UserSession, state: AppState): Promise<AppState> {
