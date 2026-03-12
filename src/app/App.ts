@@ -553,13 +553,13 @@ function resolveTickerFromRegistry(
     const synTokens = synonyms.flatMap((syn) => tokenizeCompanyText(syn));
     const combinedTokens = Array.from(new Set([...tickerTokens, ...synTokens]));
     const tokenScore = scoreTokenOverlap(rawTokens, combinedTokens);
-    if (tokenScore > 0.74 && (!best || tokenScore > best.score)) {
+    if (tokenScore > 0.74 && (!best || tokenScore > (best?.score ?? -1))) {
       best = { ticker, score: tokenScore, matchedBy: 'partial' };
     }
-    if (rawAcronym && rawAcronym === ticker && (!best || best.score < 0.8)) {
+    if (rawAcronym && rawAcronym === ticker && (!best || (best?.score ?? -1) < 0.8)) {
       best = { ticker, score: 0.8, matchedBy: 'acronym' };
     }
-    if (raw.includes(ticker) && ticker.length <= 6 && (!best || best.score < 0.76)) {
+    if (raw.includes(ticker) && ticker.length <= 6 && (!best || (best?.score ?? -1) < 0.76)) {
       best = { ticker, score: 0.76, matchedBy: 'contains' };
     }
   });
@@ -604,11 +604,11 @@ function resolveTickerFromNseMaster(
     }
     const nameTokens = tokenizeCompanyText(nameKey);
     const score = scoreTokenOverlap(rawTokens, nameTokens);
-    if (score > 0.55 && (!best || score > best.score)) {
+    if (score > 0.55 && (!best || score > (best?.score ?? -1))) {
       best = { ticker: symbolKey, score, matchedBy: 'nse_partial' };
     }
     const nameCompact = normalizeCompanyText(nameKey).replaceAll(' ', '');
-    if (rawCompact && nameCompact && nameCompact.includes(rawCompact) && (!best || best.score < 0.7)) {
+    if (rawCompact && nameCompact && nameCompact.includes(rawCompact) && (!best || (best?.score ?? -1) < 0.7)) {
       best = { ticker: symbolKey, score: 0.7, matchedBy: 'nse_contains' };
     }
   });
