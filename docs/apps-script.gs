@@ -4,6 +4,9 @@ const PENDING_USERS_SHEET = 'PendingUsers';
 const SNAPSHOTS_SHEET = 'Snapshots';
 const ADMIN_SESSIONS_SHEET = 'AdminSessions';
 const ADMIN_CONFIG_SHEET = 'AdminConfig';
+const TICKER_REGISTRY_SHEET = 'TickerRegistry';
+const TICKER_REQUESTS_SHEET = 'TickerRequests';
+const NSE_MASTER_SHEET = 'NSEMaster';
 
 function doGet(e) {
   const mode = String(e.parameter.mode || '').trim();
@@ -36,6 +39,17 @@ function doPost(e) {
   if (mode === 'push') return jsonResponse(handlePush(body));
   if (mode === 'live_prices') return jsonResponse(handleLivePrices(body));
   if (mode === 'price_history') return jsonResponse(handlePriceHistory(body));
+  if (mode === 'list_tickers') return jsonResponse(handleListTickers(body));
+  if (mode === 'upsert_ticker') return jsonResponse(handleUpsertTicker(body));
+  if (mode === 'delete_ticker') return jsonResponse(handleDeleteTicker(body));
+  if (mode === 'add_ticker_synonym') return jsonResponse(handleAddTickerSynonym(body));
+  if (mode === 'remove_ticker_synonym') return jsonResponse(handleRemoveTickerSynonym(body));
+  if (mode === 'list_nse_master') return jsonResponse(handleListNseMaster(body));
+  if (mode === 'replace_nse_master') return jsonResponse(handleReplaceNseMaster(body));
+  if (mode === 'create_ticker_requests') return jsonResponse(handleCreateTickerRequests(body));
+  if (mode === 'list_ticker_requests') return jsonResponse(handleListTickerRequests(body));
+  if (mode === 'approve_ticker_request') return jsonResponse(handleApproveTickerRequest(body));
+  if (mode === 'reject_ticker_request') return jsonResponse(handleRejectTickerRequest(body));
 
   return jsonResponse({ ok: false, message: 'Unsupported POST mode' });
 }
@@ -180,6 +194,324 @@ function handlePriceHistory(body) {
   } catch (err) {
     return { ok: false, message: normalizeLivePriceError(String((err && err.message) || err || 'unknown')) };
   }
+}
+
+function normalizeTicker(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function readTickerRegistryRows() {
+  const sheet = getSheet(TICKER_REGISTRY_SHEET, ['ticker', 'synonyms', 'updatedAt', 'updatedBy']);
+  const values = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < values.length; i += 1) {
+    const ticker = normalizeTicker(values[i][0]);
+    if (!ticker) continue;
+    const synonymsRaw = String(values[i][1] || '');
+    const synonyms = synonymsRaw
+      .split(',')
+      .map((s) => normalizeTicker(s))
+      .filter((s) => s && s !== ticker);
+    rows.push({
+      ticker: ticker,
+      synonyms: synonyms,
+      updatedAt: String(values[i][2] || ''),
+      updatedBy: String(values[i][3] || '')
+    });
+  }
+  return rows;
+}
+
+function writeTickerRegistryRow(ticker, synonyms, adminUserId) {
+  const sheet = getSheet(TICKER_REGISTRY_SHEET, ['ticker', 'synonyms', 'updatedAt', 'updatedBy']);
+  const values = sheet.getDataRange().getValues();
+  const nextSynonyms = synonyms
+    .map((s) => normalizeTicker(s))
+    .filter((s) => s && s !== ticker)
+    .join(',');
+
+  for (let i = 1; i < values.length; i += 1) {
+    const rowTicker = normalizeTicker(values[i][0]);
+    if (rowTicker !== ticker) continue;
+    sheet.getRange(i + 1, 1, 1, 4).setValues([[ticker, nextSynonyms, nowIso(), adminUserId]]);
+    return;
+  }
+  sheet.appendRow([ticker, nextSynonyms, nowIso(), adminUserId]);
+}
+
+function handleListTickers() {
+  return { ok: true, data: { rows: readTickerRegistryRows() } };
+}
+
+function handleUpsertTicker(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const ticker = normalizeTicker(body.ticker);
+  const synonymsInput = Array.isArray(body.synonyms) ? body.synonyms : [];
+  if (!ticker) return { ok: false, message: 'ticker required' };
+  const existing = readTickerRegistryRows().find((row) => row.ticker === ticker);
+  const merged = {};
+  (existing ? existing.synonyms : []).forEach((s) => (merged[normalizeTicker(s)] = true));
+  synonymsInput.forEach((s) => (merged[normalizeTicker(s)] = true));
+  const nextSynonyms = Object.keys(merged).filter((s) => s && s !== ticker);
+  writeTickerRegistryRow(ticker, nextSynonyms, auth.adminUser.userId);
+  return { ok: true, data: { rows: readTickerRegistryRows() } };
+}
+
+function handleDeleteTicker(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const ticker = normalizeTicker(body.ticker);
+  if (!ticker) return { ok: false, message: 'ticker required' };
+  const sheet = getSheet(TICKER_REGISTRY_SHEET, ['ticker', 'synonyms', 'updatedAt', 'updatedBy']);
+  const values = sheet.getDataRange().getValues();
+  for (let i = values.length - 1; i >= 1; i -= 1) {
+    if (normalizeTicker(values[i][0]) === ticker) {
+      sheet.deleteRow(i + 1);
+      break;
+    }
+  }
+  return { ok: true, data: { rows: readTickerRegistryRows() } };
+}
+
+function handleAddTickerSynonym(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const ticker = normalizeTicker(body.ticker);
+  const synonym = normalizeTicker(body.synonym);
+  if (!ticker || !synonym) return { ok: false, message: 'ticker and synonym required' };
+  const registry = readTickerRegistryRows();
+  const row = registry.find((item) => item.ticker === ticker);
+  const synonyms = row ? row.synonyms.slice() : [];
+  if (synonyms.indexOf(synonym) === -1 && synonym !== ticker) synonyms.push(synonym);
+  writeTickerRegistryRow(ticker, synonyms, auth.adminUser.userId);
+  return { ok: true, data: { rows: readTickerRegistryRows() } };
+}
+
+function handleRemoveTickerSynonym(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const ticker = normalizeTicker(body.ticker);
+  const synonym = normalizeTicker(body.synonym);
+  if (!ticker || !synonym) return { ok: false, message: 'ticker and synonym required' };
+  const registry = readTickerRegistryRows();
+  const row = registry.find((item) => item.ticker === ticker);
+  const synonyms = row ? row.synonyms.filter((s) => normalizeTicker(s) !== synonym) : [];
+  writeTickerRegistryRow(ticker, synonyms, auth.adminUser.userId);
+  return { ok: true, data: { rows: readTickerRegistryRows() } };
+}
+
+function readNseMasterRows() {
+  const sheet = getSheet(NSE_MASTER_SHEET, ['symbol', 'name', 'isin', 'updatedAt', 'updatedBy']);
+  const values = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < values.length; i += 1) {
+    const symbol = normalizeTicker(values[i][0]);
+    if (!symbol) continue;
+    rows.push({
+      symbol: symbol,
+      name: String(values[i][1] || '').trim(),
+      isin: String(values[i][2] || '').trim(),
+      updatedAt: String(values[i][3] || '').trim(),
+      updatedBy: String(values[i][4] || '').trim()
+    });
+  }
+  return rows;
+}
+
+function handleListNseMaster() {
+  return { ok: true, data: { rows: readNseMasterRows() } };
+}
+
+function handleReplaceNseMaster(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  const sheet = getSheet(NSE_MASTER_SHEET, ['symbol', 'name', 'isin', 'updatedAt', 'updatedBy']);
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, 5).setValues([['symbol', 'name', 'isin', 'updatedAt', 'updatedBy']]);
+  const now = nowIso();
+  const output = [];
+  rows.forEach((row) => {
+    const symbol = normalizeTicker(row.symbol);
+    const name = String(row.name || '').trim();
+    const isin = String(row.isin || '').trim();
+    if (!symbol || !name) return;
+    output.push([symbol, name, isin, now, auth.adminUser.userId]);
+  });
+  if (output.length) {
+    sheet.getRange(2, 1, output.length, 5).setValues(output);
+  }
+  return { ok: true, data: { rows: readNseMasterRows() } };
+}
+
+function readTickerRequestRows() {
+  const sheet = getSheet(TICKER_REQUESTS_SHEET, [
+    'requestId',
+    'userId',
+    'userName',
+    'rawSymbol',
+    'status',
+    'requestedAt',
+    'resolvedAt',
+    'resolvedBy',
+    'resolvedTicker',
+    'note'
+  ]);
+  const values = sheet.getDataRange().getValues();
+  const rows = [];
+  for (let i = 1; i < values.length; i += 1) {
+    rows.push({
+      id: String(values[i][0] || ''),
+      userId: String(values[i][1] || ''),
+      userName: String(values[i][2] || ''),
+      rawSymbol: String(values[i][3] || ''),
+      status: String(values[i][4] || ''),
+      requestedAt: String(values[i][5] || ''),
+      resolvedAt: String(values[i][6] || ''),
+      resolvedBy: String(values[i][7] || ''),
+      resolvedTicker: String(values[i][8] || ''),
+      note: String(values[i][9] || '')
+    });
+  }
+  return rows;
+}
+
+function handleCreateTickerRequests(body) {
+  const userId = String(body.userId || '').trim();
+  if (!userId) return { ok: false, message: 'userId required' };
+  const user = findActiveUserByUserId(userId);
+  if (!user) return { ok: false, message: 'User not active' };
+
+  const userName = String(body.userName || user.name || '').trim();
+  const symbols = Array.isArray(body.symbols) ? body.symbols : [];
+  if (!symbols.length) return { ok: true, data: { message: 'No symbols' } };
+
+  const sheet = getSheet(TICKER_REQUESTS_SHEET, [
+    'requestId',
+    'userId',
+    'userName',
+    'rawSymbol',
+    'status',
+    'requestedAt',
+    'resolvedAt',
+    'resolvedBy',
+    'resolvedTicker',
+    'note'
+  ]);
+  const existing = readTickerRequestRows();
+
+  symbols.forEach((symbol) => {
+    const raw = normalizeTicker(symbol);
+    if (!raw) return;
+    const already = existing.find(
+      (row) => row.userId === userId && normalizeTicker(row.rawSymbol) === raw && row.status === 'PENDING'
+    );
+    if (already) return;
+    sheet.appendRow([
+      Utilities.getUuid(),
+      userId,
+      userName,
+      raw,
+      'PENDING',
+      nowIso(),
+      '',
+      '',
+      '',
+      ''
+    ]);
+  });
+
+  return { ok: true, data: { message: 'Ticker requests created' } };
+}
+
+function handleListTickerRequests(body) {
+  const adminUserId = String(body.adminUserId || '').trim();
+  const adminToken = String(body.adminToken || '').trim();
+  if (adminUserId && adminToken) {
+    const auth = assertAdmin(adminUserId, adminToken);
+    if (!auth.ok) return auth;
+    return { ok: true, data: { rows: readTickerRequestRows() } };
+  }
+  const userId = String(body.userId || '').trim();
+  if (!userId) return { ok: false, message: 'userId required' };
+  const rows = readTickerRequestRows().filter((row) => row.userId === userId);
+  return { ok: true, data: { rows: rows } };
+}
+
+function handleApproveTickerRequest(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const requestId = String(body.requestId || '').trim();
+  const resolvedTicker = normalizeTicker(body.resolvedTicker);
+  if (!requestId || !resolvedTicker) return { ok: false, message: 'requestId and resolvedTicker required' };
+
+  const sheet = getSheet(TICKER_REQUESTS_SHEET, [
+    'requestId',
+    'userId',
+    'userName',
+    'rawSymbol',
+    'status',
+    'requestedAt',
+    'resolvedAt',
+    'resolvedBy',
+    'resolvedTicker',
+    'note'
+  ]);
+  const values = sheet.getDataRange().getValues();
+  let rawSymbol = '';
+  for (let i = 1; i < values.length; i += 1) {
+    if (String(values[i][0] || '').trim() !== requestId) continue;
+    rawSymbol = String(values[i][3] || '').trim();
+    values[i][4] = 'APPROVED';
+    values[i][6] = nowIso();
+    values[i][7] = auth.adminUser.userId;
+    values[i][8] = resolvedTicker;
+    sheet.getRange(i + 1, 1, 1, values[i].length).setValues([values[i]]);
+    break;
+  }
+  if (!rawSymbol) return { ok: false, message: 'Request not found' };
+
+  const registry = readTickerRegistryRows();
+  const row = registry.find((item) => item.ticker === resolvedTicker);
+  const synonyms = row ? row.synonyms.slice() : [];
+  if (rawSymbol && normalizeTicker(rawSymbol) !== resolvedTicker) {
+    if (synonyms.indexOf(normalizeTicker(rawSymbol)) === -1) synonyms.push(normalizeTicker(rawSymbol));
+  }
+  writeTickerRegistryRow(resolvedTicker, synonyms, auth.adminUser.userId);
+  return { ok: true, data: { rows: readTickerRequestRows() } };
+}
+
+function handleRejectTickerRequest(body) {
+  const auth = assertAdmin(body.adminUserId, body.adminToken);
+  if (!auth.ok) return auth;
+  const requestId = String(body.requestId || '').trim();
+  const note = String(body.note || '').trim();
+  if (!requestId) return { ok: false, message: 'requestId required' };
+
+  const sheet = getSheet(TICKER_REQUESTS_SHEET, [
+    'requestId',
+    'userId',
+    'userName',
+    'rawSymbol',
+    'status',
+    'requestedAt',
+    'resolvedAt',
+    'resolvedBy',
+    'resolvedTicker',
+    'note'
+  ]);
+  const values = sheet.getDataRange().getValues();
+  for (let i = 1; i < values.length; i += 1) {
+    if (String(values[i][0] || '').trim() !== requestId) continue;
+    values[i][4] = 'REJECTED';
+    values[i][6] = nowIso();
+    values[i][7] = auth.adminUser.userId;
+    values[i][9] = note || 'Rejected';
+    sheet.getRange(i + 1, 1, 1, values[i].length).setValues([values[i]]);
+    break;
+  }
+  return { ok: true, data: { rows: readTickerRequestRows() } };
 }
 
 function isValidIsoDate(value) {

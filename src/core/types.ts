@@ -48,6 +48,11 @@ export type Transaction = {
 export type AppState = {
   transactions: Transaction[];
   stockMappings: StockMapping[];
+  tickerRegistry?: TickerRegistryItem[];
+  tickerRequests?: TickerRequest[];
+  nseMaster?: NseMasterItem[];
+  blockedMappings?: string[];
+  tickerAliases?: TickerAliasGroup[];
   livePrices: Record<string, LivePrice>;
   expenses: ExpenseRow[];
   debtItems: DebtRow[];
@@ -60,6 +65,40 @@ export type AppState = {
 export type StockMapping = {
   stock: string;
   ticker: string;
+  enabled: boolean;
+  updatedAt: string;
+};
+
+export type TickerRegistryItem = {
+  ticker: string;
+  synonyms: string[];
+  updatedAt: string;
+};
+
+export type NseMasterItem = {
+  symbol: string;
+  name: string;
+  isin: string;
+  updatedAt: string;
+  updatedBy?: string;
+};
+
+export type TickerRequest = {
+  id: string;
+  userId: string;
+  userName: string;
+  rawSymbol: string;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  requestedAt: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  resolvedTicker?: string;
+  note?: string;
+};
+
+export type TickerAliasGroup = {
+  ticker: string;
+  aliases: string[];
   enabled: boolean;
   updatedAt: string;
 };

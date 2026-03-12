@@ -31,23 +31,30 @@ import { fetchPriceHistory, syncLivePrices } from '../core/livePrices';
 import { calculateRealizedPnlRows, type RealizedPnlRow } from '../core/pnl';
 import { sortTransactionsChronologically } from '../core/txOrder';
 import {
+  approveTickerRequestRemote,
+  fetchTickerRegistry,
+  fetchTickerRequests,
+  fetchNseMaster,
+  replaceNseMaster,
+  submitTickerRequests,
+  rejectTickerRequestRemote
+} from '../core/tickers';
+import {
   appendTransactions,
   clearTransactions,
   deleteTransaction,
   deleteCreditItem,
   deleteDebtItem,
   deleteExpense,
-  deleteStockMapping,
   readState,
   upsertCreditItem,
   upsertDebtItem,
   upsertExpense,
-  upsertStockMapping,
   upsertTransaction,
   writeState
 } from '../core/storage';
 import { pullFromCloud, pushToCloud, trimSnapshots } from '../core/sync';
-import type { AppState, HoldingRow, UserRole, UserSession } from '../core/types';
+import type { AppState, HoldingRow, StockMapping, UserRole, UserSession } from '../core/types';
 
 export type AppView =
   | 'dashboard'
@@ -119,6 +126,23 @@ function toIsoDate(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
+}
+
+function toIsoDateTimeLocal(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  return `${y}-${m}-${d}T${hh}:${mm}`;
+}
+
+function parseDateTimeLocal(value: string): Date | null {
+  const raw = String(value || '').trim();
+  if (!raw.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/)) return null;
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt;
 }
 
 function isValidIsoDate(value: string): boolean {
@@ -329,10 +353,56 @@ function applyPnlFilters(rows: RealizedPnlRow[], filters: PnlFilterState): Reali
 function resolveTicker(state: AppState, stock: string): string {
   const symbol = String(stock || '').trim().toUpperCase();
   if (!symbol) return '';
-  const mapping = state.stockMappings.find(
+  const mapping = getExpandedMappings(state).find(
     (row) => row.enabled && String(row.stock || '').trim().toUpperCase() === symbol
   );
   return String(mapping?.ticker || symbol).trim().toUpperCase();
+}
+
+function getExpandedMappings(state: AppState): StockMapping[] {
+  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  if (!registry.length) return state.stockMappings;
+  const expanded: StockMapping[] = [];
+  registry.forEach((item) => {
+    const ticker = String(item.ticker || '').trim().toUpperCase();
+    if (!ticker) return;
+    const synonyms = Array.isArray(item.synonyms) ? item.synonyms : [];
+    const aliases = Array.from(
+      new Set([ticker, ...synonyms.map((syn) => String(syn || '').trim().toUpperCase())].filter(Boolean))
+    );
+    aliases.forEach((alias) => {
+      expanded.push({
+        stock: alias,
+        ticker,
+        enabled: true,
+        updatedAt: item.updatedAt || new Date().toISOString()
+      });
+    });
+  });
+  return expanded;
+}
+
+function getCanonicalMappings(state: AppState): StockMapping[] {
+  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  if (registry.length) {
+    return registry
+      .map((item) => ({
+        stock: String(item.ticker || '').trim().toUpperCase(),
+        ticker: String(item.ticker || '').trim().toUpperCase(),
+        enabled: true,
+        updatedAt: item.updatedAt || new Date().toISOString()
+      }))
+      .filter((row) => row.stock);
+  }
+  const unique = new Map<string, StockMapping>();
+  state.stockMappings.forEach((row) => {
+    const ticker = String(row.ticker || '').trim().toUpperCase();
+    if (!ticker) return;
+    if (!unique.has(ticker)) {
+      unique.set(ticker, { stock: ticker, ticker, enabled: row.enabled, updatedAt: row.updatedAt });
+    }
+  });
+  return Array.from(unique.values());
 }
 
 function stripOrderIdFromNote(text: string): string {
@@ -346,6 +416,216 @@ function stripOrderIdFromNote(text: string): string {
 
 function normalizeSearchQuery(raw: string): string {
   return String(raw || '').trim().replace(/\s+/g, ' ');
+}
+
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (char === ',' && !inQuotes) {
+      out.push(current);
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  out.push(current);
+  return out.map((item) => String(item || '').trim());
+}
+
+function isValidTickerFormat(value: string): boolean {
+  const text = String(value || '').trim().toUpperCase();
+  if (!text) return false;
+  if (/\s/.test(text)) return false;
+  return /^[A-Z0-9.:_-]+$/.test(text);
+}
+
+const COMPANY_STOPWORDS = new Set([
+  'LIMITED',
+  'LTD',
+  'LTD.',
+  'CORPORATION',
+  'CORP',
+  'COMPANY',
+  'CO',
+  'CO.',
+  'PVT',
+  'PRIVATE',
+  'PLC',
+  'INC',
+  'INDIA',
+  'INDUSTRIES',
+  'INDUSTRY',
+  'HOLDINGS',
+  'HOLDING',
+  'SERVICES',
+  'SERVICE',
+  'THE',
+  'OF',
+  'AND'
+]);
+
+function normalizeCompanyText(value: string): string {
+  return String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .split(' ')
+    .map((token) => token.trim())
+    .filter((token) => token && !COMPANY_STOPWORDS.has(token))
+    .join(' ');
+}
+
+function tokenizeCompanyText(value: string): string[] {
+  return normalizeCompanyText(value).split(' ').filter(Boolean);
+}
+
+function buildAcronym(value: string): string {
+  const tokens = tokenizeCompanyText(value);
+  if (!tokens.length) return '';
+  return tokens.map((token) => token[0]).join('');
+}
+
+function scoreTokenOverlap(aTokens: string[], bTokens: string[]): number {
+  if (!aTokens.length || !bTokens.length) return 0;
+  const aSet = new Set(aTokens);
+  let overlap = 0;
+  bTokens.forEach((token) => {
+    if (aSet.has(token)) overlap += 1;
+  });
+  return overlap / Math.max(aTokens.length, bTokens.length);
+}
+
+function resolveTickerFromRegistry(
+  state: AppState,
+  symbol: string
+): { ticker: string; score: number; matchedBy: string } | null {
+  const raw = String(symbol || '').trim().toUpperCase();
+  if (!raw) return null;
+  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  if (!registry.length) {
+    const mapping = state.stockMappings.find((row) => String(row.stock || '').trim().toUpperCase() === raw);
+    if (mapping) {
+      return { ticker: String(mapping.ticker || '').trim().toUpperCase(), score: 0.9, matchedBy: 'mapping' };
+    }
+    return null;
+  }
+
+  const rawTokens = tokenizeCompanyText(raw);
+  const rawAcronym = buildAcronym(raw);
+  let best: { ticker: string; score: number; matchedBy: string } | null = null;
+
+  registry.forEach((item) => {
+    const ticker = String(item.ticker || '').trim().toUpperCase();
+    if (!ticker) return;
+    if (raw === ticker) {
+      best = { ticker, score: 1, matchedBy: 'exact' };
+      return;
+    }
+    const synonyms = Array.isArray(item.synonyms) ? item.synonyms : [];
+    for (const syn of synonyms) {
+      const synText = String(syn || '').trim().toUpperCase();
+      if (!synText) continue;
+      if (synText === raw) {
+        if (!best || best.score < 0.98) best = { ticker, score: 0.98, matchedBy: 'synonym' };
+        return;
+      }
+    }
+    const tickerTokens = tokenizeCompanyText(ticker);
+    const synTokens = synonyms.flatMap((syn) => tokenizeCompanyText(syn));
+    const combinedTokens = Array.from(new Set([...tickerTokens, ...synTokens]));
+    const tokenScore = scoreTokenOverlap(rawTokens, combinedTokens);
+    if (tokenScore > 0.74 && (!best || tokenScore > best.score)) {
+      best = { ticker, score: tokenScore, matchedBy: 'partial' };
+    }
+    if (rawAcronym && rawAcronym === ticker && (!best || best.score < 0.8)) {
+      best = { ticker, score: 0.8, matchedBy: 'acronym' };
+    }
+    if (raw.includes(ticker) && ticker.length <= 6 && (!best || best.score < 0.76)) {
+      best = { ticker, score: 0.76, matchedBy: 'contains' };
+    }
+  });
+
+  return best && best.score >= 0.75 ? best : null;
+}
+
+function resolveTickerFromNseMaster(
+  state: AppState,
+  symbol: string
+): { ticker: string; score: number; matchedBy: string } | null {
+  const raw = String(symbol || '').trim().toUpperCase();
+  if (!raw) return null;
+  const nseMaster = Array.isArray(state.nseMaster) ? state.nseMaster : [];
+  if (!nseMaster.length) return null;
+  const rawTokens = tokenizeCompanyText(raw);
+  const rawCompact = normalizeCompanyText(raw).replaceAll(' ', '');
+  const rawNormalized = normalizeCompanyText(raw);
+  let best: { ticker: string; score: number; matchedBy: string } | null = null;
+
+  nseMaster.forEach((row) => {
+    const symbolKey = String(row.symbol || '').trim().toUpperCase();
+    const nameKey = String(row.name || '').trim().toUpperCase();
+    const isinKey = String(row.isin || '').trim().toUpperCase();
+    if (!symbolKey) return;
+    if (raw === symbolKey) {
+      best = { ticker: symbolKey, score: 1, matchedBy: 'nse_symbol' };
+      return;
+    }
+    if (isinKey && raw === isinKey) {
+      best = { ticker: symbolKey, score: 0.99, matchedBy: 'nse_isin' };
+      return;
+    }
+    if (nameKey && raw === nameKey) {
+      best = { ticker: symbolKey, score: 0.98, matchedBy: 'nse_name' };
+      return;
+    }
+    const nameNormalized = normalizeCompanyText(nameKey);
+    if (rawNormalized && nameNormalized && rawNormalized === nameNormalized) {
+      best = { ticker: symbolKey, score: 0.97, matchedBy: 'nse_name_normalized' };
+      return;
+    }
+    const nameTokens = tokenizeCompanyText(nameKey);
+    const score = scoreTokenOverlap(rawTokens, nameTokens);
+    if (score > 0.55 && (!best || score > best.score)) {
+      best = { ticker: symbolKey, score, matchedBy: 'nse_partial' };
+    }
+    const nameCompact = normalizeCompanyText(nameKey).replaceAll(' ', '');
+    if (rawCompact && nameCompact && nameCompact.includes(rawCompact) && (!best || best.score < 0.7)) {
+      best = { ticker: symbolKey, score: 0.7, matchedBy: 'nse_contains' };
+    }
+  });
+
+  return best;
+}
+
+async function refreshTickerData(session: UserSession, state: AppState): Promise<AppState> {
+  try {
+    const [registry, requests, nseMaster] = await Promise.all([
+      fetchTickerRegistry(),
+      fetchTickerRequests(session),
+      fetchNseMaster()
+    ]);
+    const next: AppState = ensureDefaultMappings({
+      ...state,
+      tickerRegistry: registry,
+      tickerRequests: requests,
+      nseMaster
+    });
+    writeState(session, next);
+    return next;
+  } catch (error) {
+    return state;
+  }
 }
 
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -622,7 +902,7 @@ function renderDashboardHome(state: AppState): string {
     .join('');
   const mobileTrendButtons = `<button type="button" class="mini" data-mobile-trend="7D">7D</button>`;
   const snapshot = dashboardFromState(state);
-  const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
+  const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices);
   const invested = holdings.reduce((sum, h) => sum + Number(h.invested || 0), 0);
   const portfolioValue = holdings.reduce((sum, h) => sum + Number(h.marketValue || h.invested || 0), 0);
   const unrealized = holdings.reduce((sum, h) => sum + Number(h.unrealized || 0), 0);
@@ -1449,24 +1729,31 @@ function getInitialView(): AppView {
 
 function ensureDefaultMappings(state: AppState): AppState {
   const normalizedCreditItems = Array.isArray(state.creditItems) ? state.creditItems : [];
-  const map = new Map(state.stockMappings.map((item) => [item.stock, item] as const));
-  let changed = !Array.isArray(state.creditItems);
-  for (const txn of state.transactions) {
-    const stock = String(txn.symbol || '').trim().toUpperCase();
-    if (!stock || map.has(stock)) continue;
-    changed = true;
-    map.set(stock, {
-      stock,
-      ticker: stock,
-      enabled: true,
-      updatedAt: new Date().toISOString()
-    });
+  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  if (!registry.length) {
+    return { ...state, creditItems: normalizedCreditItems };
   }
-
-  if (!changed) return { ...state, creditItems: normalizedCreditItems };
+  const stockMappings: StockMapping[] = [];
+  registry.forEach((item) => {
+    const ticker = String(item.ticker || '').trim().toUpperCase();
+    if (!ticker) return;
+    const synonyms = Array.isArray(item.synonyms) ? item.synonyms : [];
+    const aliases = Array.from(
+      new Set([ticker, ...synonyms.map((syn) => String(syn || '').trim().toUpperCase())].filter(Boolean))
+    );
+    aliases.forEach((alias) => {
+      stockMappings.push({
+        stock: alias,
+        ticker,
+        enabled: true,
+        updatedAt: item.updatedAt || new Date().toISOString()
+      });
+    });
+  });
+  stockMappings.sort((a, b) => a.stock.localeCompare(b.stock));
   return {
     ...state,
-    stockMappings: Array.from(map.values()).sort((a, b) => a.stock.localeCompare(b.stock)),
+    stockMappings,
     creditItems: normalizedCreditItems
   };
 }
@@ -1651,6 +1938,9 @@ function currentCycleStartDateForStock(state: AppState, stock: string): string {
 function renderHoldingsHome(state: AppState, holdings: HoldingRow[]): string {
   const currency = state.settings.currency;
   const investedTotal = holdings.reduce((sum, row) => sum + Number(row.invested || 0), 0);
+  const holdingTickers = Array.from(
+    new Set(holdings.map((row) => String(row.ticker || '').trim().toUpperCase()).filter(Boolean))
+  );
   const allocationRows = holdings
     .map((row) => ({
       ...row,
@@ -1679,6 +1969,22 @@ function renderHoldingsHome(state: AppState, holdings: HoldingRow[]): string {
     .sort((a, b) => Number(a.unrealized || 0) - Number(b.unrealized || 0))
     .slice(0, 6);
   const maxAbsUnrealized = Math.max(1, ...performanceRows.map((row) => Math.abs(Number(row.unrealized || 0))));
+  const holdingTickerRows = holdingTickers.map((ticker) => {
+    const live = state.livePrices[String(ticker || '').trim().toUpperCase()];
+    const ltp = Number(live?.price || 0);
+    const changePctRaw = Number(live?.changePct || 0);
+    const changePct = Number.isFinite(changePctRaw) ? changePctRaw : 0;
+    const statusClass = ltp > 0 ? 'ok' : 'warn';
+    const changeClass = changePct >= 0 ? 'profit' : 'loss';
+    return `
+      <div class="ticker-row" data-ticker="${esc(ticker)}" data-ltp="${ltp}" data-change="${changePct}">
+        <strong>${esc(ticker)}</strong>
+        <span class="status-pill ${statusClass}">${ltp > 0 ? 'Live' : 'No Live'}</span>
+        <span>${ltp > 0 ? formatCurrency(ltp, currency) : '-'}</span>
+        <span class="${changeClass}">${ltp > 0 ? `${changePct.toFixed(2)}%` : '-'}</span>
+      </div>
+    `;
+  });
 
   return `
     <section class="holdings-home">
@@ -1738,6 +2044,35 @@ function renderHoldingsHome(state: AppState, holdings: HoldingRow[]): string {
             }
           </div>
         </section>
+      </section>
+
+      <section class="panel holdings-ticker-panel">
+        <div class="insight-section-head">
+          <h2>Holding Tickers</h2>
+          <span class="tiny-label">Read-only list</span>
+        </div>
+        <div class="holdings-ticker-controls">
+          <input id="holding-ticker-search" type="text" placeholder="Search tickers..." />
+          <select id="holding-ticker-sort">
+            <option value="az">A-Z</option>
+            <option value="za">Z-A</option>
+            <option value="ltp">Highest LTP</option>
+            <option value="change">Highest Change %</option>
+          </select>
+        </div>
+        <div class="holdings-ticker-table" id="holding-ticker-table">
+          <div class="ticker-row header">
+            <span>Ticker</span>
+            <span>Status</span>
+            <span>LTP</span>
+            <span>Change</span>
+          </div>
+          ${
+            holdingTickerRows.length
+              ? holdingTickerRows.join('')
+              : '<p class="muted">No holdings yet.</p>'
+          }
+        </div>
       </section>
 
       <section class="panel">
@@ -2012,7 +2347,7 @@ function buildPnlStockRows(rows: RealizedPnlRow[]): PnlStockRow[] {
 }
 
 function buildUnrealizedRows(state: AppState): UnrealizedRow[] {
-  const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
+  const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices);
   return holdings
     .filter((row) => Number(row.quantity || 0) > 0)
     .map((row) => {
@@ -2421,27 +2756,151 @@ function buildPnlStudio(state: AppState): string {
   `;
 }
 
-function mappingRows(state: AppState): string {
-  if (!state.stockMappings.length) {
-    return '<tr class="mapping-empty-row"><td colspan="4">No mappings yet.</td></tr>';
+function renderTickerRequests(state: AppState, session: UserSession, mode: 'admin' | 'user'): string {
+  const requests = Array.isArray(state.tickerRequests) ? state.tickerRequests : [];
+  const filtered =
+    mode === 'admin'
+      ? requests
+      : requests.filter((req) => req.userId === session.userId);
+  if (!filtered.length) {
+    return '<div class="muted">No ticker requests yet.</div>';
+  }
+  const order: Record<string, number> = { PENDING: 0, APPROVED: 1, REJECTED: 2 };
+  const sorted = filtered
+    .slice()
+    .sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
+
+  if (mode === 'user') {
+    return `
+      <div class="ticker-request-cards">
+        ${sorted
+          .map((req) => {
+            const statusClass =
+              req.status === 'APPROVED' ? 'ok' : req.status === 'REJECTED' ? 'warn' : 'pending';
+            return `
+              <article class="ticker-request-card" data-request-id="${esc(req.id)}">
+                <div class="ticker-request-head">
+                  <div>
+                    <h3>${esc(req.rawSymbol)}</h3>
+                    <div class="tiny-label">Requested ${formatDateCompact(req.requestedAt)}</div>
+                  </div>
+                  <span class="status-pill ${statusClass}">${esc(req.status)}</span>
+                </div>
+                <div class="ticker-request-meta">
+                  <div><span class="tiny-label">Resolved</span><strong>${esc(req.resolvedTicker || '-')}</strong></div>
+                  <div><span class="tiny-label">Request ID</span><strong>${esc(req.id)}</strong></div>
+                </div>
+              </article>
+            `;
+          })
+          .join('')}
+      </div>
+    `;
   }
 
-  return state.stockMappings
-    .map(
-      (row) => `
-    <tr>
-      <td data-label="Stock">${esc(row.stock)}</td>
-      <td data-label="Ticker">${esc(row.ticker)}</td>
-      <td data-label="Status">${row.enabled ? 'Enabled' : 'Disabled'}</td>
-      <td data-label="Action">
-        <button type="button" class="mini" data-edit-mapping="${esc(row.stock)}">Edit</button>
-        <button type="button" class="mini ghost" data-del-mapping="${esc(row.stock)}">Delete</button>
-      </td>
-    </tr>
-  `
-    )
+  return `
+    <div class="ticker-request-cards admin">
+      ${sorted
+        .map((req) => {
+          const statusClass =
+            req.status === 'APPROVED' ? 'ok' : req.status === 'REJECTED' ? 'warn' : 'pending';
+          const suggested =
+            (resolveTickerFromRegistry(state, req.rawSymbol) || resolveTickerFromNseMaster(state, req.rawSymbol))
+              ?.ticker || '';
+          return `
+            <article class="ticker-request-card" data-request-id="${esc(req.id)}">
+              <div class="ticker-request-head">
+                <div>
+                  <h3>${esc(req.rawSymbol)}</h3>
+                  <div class="tiny-label">Requested by ${esc(req.userName || req.userId)} · ${formatDateCompact(req.requestedAt)}</div>
+                </div>
+                <span class="status-pill ${statusClass}">${esc(req.status)}</span>
+              </div>
+              <div class="ticker-request-meta">
+                <div><span class="tiny-label">Suggested</span><strong>${esc(suggested || '-')}</strong></div>
+                <div><span class="tiny-label">Resolved</span><strong>${esc(req.resolvedTicker || '-')}</strong></div>
+              </div>
+              <div class="ticker-request-actions">
+                ${
+                  req.status === 'PENDING'
+                    ? `
+                      <button type="button" class="mini" data-request-approve="${esc(req.id)}">Approve</button>
+                      <button type="button" class="mini ghost" data-request-reject="${esc(req.id)}">Reject</button>
+                    `
+                    : '<span class="tiny-label">Resolved</span>'
+                }
+              </div>
+            </article>
+          `;
+        })
+        .join('')}
+    </div>
+  `;
+}
+
+function renderTickerRequestModal(state: AppState): string {
+  return `
+    <div id="ticker-approve-modal" class="trade-modal" aria-hidden="true">
+      <div class="trade-modal-card ticker-approve-card">
+        <div class="trade-modal-head">
+          <h2>Resolve Ticker Request</h2>
+          <button id="close-ticker-approve-btn" type="button" class="ghost mini">Close</button>
+        </div>
+        <form id="ticker-approve-form" class="stack compact">
+          <input name="requestId" type="hidden" />
+          <div class="ticker-approve-grid">
+            <label class="ticker-approve-field">
+              <span class="tiny-label">Requested Symbol</span>
+              <input name="rawSymbol" type="text" disabled />
+            </label>
+            <label class="ticker-approve-field">
+              <span class="tiny-label">Suggested</span>
+              <input name="suggestedSymbol" type="text" disabled />
+            </label>
+          </div>
+          <label class="ticker-approve-field">
+            <span class="tiny-label">Resolved Ticker</span>
+            <input name="resolvedSymbol" type="text" list="ticker-master-options" placeholder="e.g. BERGEPAINT" />
+          </label>
+          <datalist id="ticker-master-options">
+            ${buildTickerOptions(state)}
+          </datalist>
+          <label class="ticker-approve-field">
+            <span class="tiny-label">Reject Note (optional)</span>
+            <input name="rejectNote" type="text" placeholder="Reason for rejection" />
+          </label>
+          <div class="actions-row">
+            <button type="submit">Approve</button>
+            <button id="ticker-reject-btn" type="button" class="ghost">Reject</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function buildTickerOptions(state: AppState): string {
+  const options = new Map<string, string>();
+  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  const nseMaster = Array.isArray(state.nseMaster) ? state.nseMaster : [];
+  registry.forEach((row) => {
+    const ticker = String(row.ticker || '').trim().toUpperCase();
+    if (!ticker) return;
+    if (!options.has(ticker)) options.set(ticker, ticker);
+  });
+  nseMaster.forEach((row) => {
+    const ticker = String(row.symbol || '').trim().toUpperCase();
+    const name = String(row.name || '').trim();
+    if (!ticker) return;
+    if (!options.has(ticker)) options.set(ticker, name || ticker);
+  });
+  return Array.from(options.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([ticker, name]) => `<option value="${esc(ticker)}">${esc(name || ticker)}</option>`)
     .join('');
 }
+
+// Ticker registry UI removed; NSE master + requests drive canonical matching.
 
 const normalizeStockKey = (value: string): string => String(value || '').trim().toUpperCase();
 
@@ -2528,7 +2987,7 @@ function renderTargetPlanner(state: AppState): string {
   const currency = state.settings.currency;
   const targetPct = Number(state.settings.sellTargetPct || 0);
 
-  const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices)
+  const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices)
     .filter((row) => Number(row.quantity || 0) > 0)
     .filter((row) => {
       const live = state.livePrices[String(row.ticker || '').trim().toUpperCase()];
@@ -2699,26 +3158,26 @@ function renderTargetPlanner(state: AppState): string {
                       .map(
                         (row) => `
                         <tr>
-                          <td>${esc(row.stock)}</td>
-                          <td>${row.qty}</td>
-                          <td>${formatCurrency(row.avg, currency)}</td>
-                          <td>${formatCurrency(row.ltp, currency)}</td>
-                          <td>${formatCurrency(row.targetPrice, currency)}</td>
-                          <td class="${row.expectedProfit >= 0 ? 'profit' : 'loss'}">${formatCurrency(row.expectedProfit, currency)}</td>
-                          <td>${row.returnPct.toFixed(2)}%</td>
-                          <td>
+                          <td data-label="Stock">${esc(row.stock)}</td>
+                          <td data-label="Qty">${row.qty}</td>
+                          <td data-label="Avg Price">${formatCurrency(row.avg, currency)}</td>
+                          <td data-label="Current LTP">${formatCurrency(row.ltp, currency)}</td>
+                          <td data-label="Target Price">${formatCurrency(row.targetPrice, currency)}</td>
+                          <td data-label="Expected Profit" class="${row.expectedProfit >= 0 ? 'profit' : 'loss'}">${formatCurrency(row.expectedProfit, currency)}</td>
+                          <td data-label="Return %">${row.returnPct.toFixed(2)}%</td>
+                          <td data-label="Progress">
                             <div class="target-progress">
                               <div class="target-progress-bar" style="width:${(row.progress * 100).toFixed(1)}%"></div>
                             </div>
                             <span class="tiny-label">${(row.progress * 100).toFixed(1)}%</span>
                           </td>
-                          <td><span class="status-pill ${row.statusClass}">${row.status}</span></td>
-                          <td><button class="mini ghost" data-target-breakdown="${esc(row.stock)}">View Breakdown</button></td>
+                          <td data-label="Status"><span class="status-pill ${row.statusClass}">${row.status}</span></td>
+                          <td data-label="Action"><button class="mini ghost" data-target-breakdown="${esc(row.stock)}">View Breakdown</button></td>
                         </tr>
                       `
                       )
                       .join('')
-                  : `<tr><td colspan="10">No active holdings with live prices.</td></tr>`
+                  : `<tr class="target-empty-row"><td colspan="10">No active holdings with live prices.</td></tr>`
               }
             </tbody>
           </table>
@@ -2748,11 +3207,11 @@ function renderTargetPlanner(state: AppState): string {
                       .map(
                         (row) => `
                         <tr>
-                          <td>${esc(row.stock)}</td>
-                          <td>${row.qty}</td>
-                          <td class="${row.profit >= 0 ? 'profit' : 'loss'}">${formatCurrency(row.profit, currency)}</td>
-                          <td>${row.lastDate ? esc(formatDateFromISOToDDMM(row.lastDate)) : '-'}</td>
-                          <td>
+                          <td data-label="Stock">${esc(row.stock)}</td>
+                          <td data-label="Qty Sold">${row.qty}</td>
+                          <td data-label="Profit" class="${row.profit >= 0 ? 'profit' : 'loss'}">${formatCurrency(row.profit, currency)}</td>
+                          <td data-label="Completion Date">${row.lastDate ? esc(formatDateFromISOToDDMM(row.lastDate)) : '-'}</td>
+                          <td data-label="Status">
                             <span class="status-pill ok" title="Avg Buy ${formatCurrency(row.avgPrice, currency)} | Target ${formatCurrency(row.targetPrice, currency)}">
                               Completed
                             </span>
@@ -2761,7 +3220,7 @@ function renderTargetPlanner(state: AppState): string {
                       `
                       )
                       .join('')
-                  : `<tr><td colspan="5">No completed targets yet.</td></tr>`
+                  : `<tr class="target-empty-row"><td colspan="5">No completed targets yet.</td></tr>`
               }
             </tbody>
           </table>
@@ -3445,7 +3904,7 @@ function renderExitAnalysis(
 }
 
 function renderPageContent(view: AppView, session: UserSession, state: AppState): string {
-  const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
+  const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices);
 
   if (view === 'dashboard') {
     return renderDashboardHome(state);
@@ -3461,7 +3920,15 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
         <div class="txn-toolbar-main">
           <button id="add-trade-btn" type="button">+ Add Trade</button>
           <button id="import-cta-btn" type="button" class="ghost">Import CSV</button>
-          <button id="jump-mapping-btn" type="button" class="ghost mini" title="Go to stock-ticker mapping">Map</button>
+          <select id="import-broker" class="ghost" aria-label="Import broker">
+            <option value="AUTO">Auto-detect</option>
+            <option value="ZERODHA">Zerodha</option>
+            <option value="UPSTOX">Upstox</option>
+            <option value="ANGEL_ONE">Angel One</option>
+            <option value="GROWW">Groww</option>
+            <option value="OTHER">Other</option>
+          </select>
+          <button id="jump-requests-btn" type="button" class="ghost mini" title="Go to ticker requests">Requests</button>
           <button id="sync-live-btn" type="button" class="ghost">Sync Live</button>
           <button id="clear-transactions-btn" type="button" class="ghost">Delete All</button>
         </div>
@@ -3492,18 +3959,13 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
         </div>
       </section>
 
-      <section class="panel" id="mapping-section">
-        <h2>Stock-Ticker Mapping</h2>
-        <form id="mapping-form" class="stack compact">
-          <input name="stock" type="text" placeholder="Stock Name (e.g. TCS)" required />
-          <input name="ticker" type="text" placeholder="Ticker (default same as stock)" />
-          <button type="submit">Save Mapping</button>
-        </form>
-        <div class="table-wrap">
-          <table class="mapping-table">
-            <thead><tr><th>Stock</th><th>Ticker</th><th>Status</th><th>Action</th></tr></thead>
-            <tbody>${mappingRows(state)}</tbody>
-          </table>
+      <section class="panel ticker-requests-panel" id="ticker-requests">
+        <div class="insight-section-head">
+          <h2>Ticker Requests</h2>
+          <span class="tiny-label">Unmatched symbols are routed to admin for approval.</span>
+        </div>
+        <div class="ticker-requests-list">
+          ${renderTickerRequests(state, session, session.role === 'ADMIN' ? 'admin' : 'user')}
         </div>
       </section>
 
@@ -3520,8 +3982,11 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           <div id="trade-panel-details" class="trade-panel active">
             <form id="manual-form" class="stack compact">
               <input name="editId" type="hidden" />
-              <input name="tradeDate" type="text" placeholder="DD-MM-YYYY" value="${formatDateDDMMYYYY(new Date())}" required />
-              <input name="symbol" type="text" placeholder="Stock Symbol (e.g. TCS)" required />
+              <input name="tradeDateTime" type="datetime-local" value="${toIsoDateTimeLocal(new Date())}" required />
+              <input name="symbol" type="text" list="trade-ticker-options" placeholder="Stock Symbol (e.g. TCS)" required />
+              <datalist id="trade-ticker-options">
+                ${buildTickerOptions(state)}
+              </datalist>
               <select name="side" required>
                 <option value="BUY">BUY</option>
                 <option value="SELL">SELL</option>
@@ -3547,6 +4012,7 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           </div>
         </div>
       </div>
+      ${renderTickerRequestModal(state)}
     `;
   }
 
@@ -3952,8 +4418,9 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
   }
 
   if (view === 'cloud') {
-    const totalMappings = state.stockMappings.length;
-    const validMappings = state.stockMappings.filter((m) => m.enabled).length;
+    const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+    const totalMappings = registry.length;
+    const validMappings = registry.filter((m) => isValidTickerFormat(m.ticker)).length;
     const invalidMappings = Math.max(0, totalMappings - validMappings);
     const lastSyncText = state.lastSyncedAt ? new Date(state.lastSyncedAt).toLocaleString() : 'Never';
     const autoSyncEnabled = getCloudAutoSyncEnabled();
@@ -3975,7 +4442,7 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
         <article class="panel cloud-kpi-card">
           <span class="cloud-kpi-title">Last Snapshot</span>
           <strong>${state.transactions.length + state.expenses.length + state.debtItems.length + state.creditItems.length}</strong>
-          <em class="muted">Holdings: ${calculateHoldings(state.transactions, state.stockMappings, state.livePrices).length}</em>
+          <em class="muted">Holdings: ${calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices).length}</em>
         </article>
         <article class="panel cloud-kpi-card">
           <span class="cloud-kpi-title">Auto Sync</span>
@@ -4001,8 +4468,8 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           </label>
         </div>
         <div class="cloud-export-row">
-          <button id="export-csv-btn" class="ghost mini" type="button">Export CSV</button>
-          <button id="export-pdf-btn" class="ghost mini" type="button">Export PDF</button>
+          <button id="export-excel-btn" class="ghost mini" type="button">Export Excel</button>
+          <button id="export-word-btn" class="ghost mini" type="button">Export Word</button>
         </div>
       </section>
 
@@ -4344,13 +4811,13 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
               </div>
             </div>
             <div class="table-wrap">
-              <table>
+              <table class="admin-users-table">
                 <thead>
                   <tr>
                     <th>Name</th><th>Login</th><th>Role</th><th>Status</th><th>Created</th><th>Action</th>
                   </tr>
                 </thead>
-                <tbody id="admin-users-body"><tr><td colspan="6">Loading users...</td></tr></tbody>
+                <tbody id="admin-users-body"><tr class="admin-empty-row"><td colspan="6">Loading users...</td></tr></tbody>
               </table>
             </div>
           </section>
@@ -4361,16 +4828,38 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
               <button id="admin-pending-refresh" type="button" class="mini">Refresh</button>
             </div>
             <div class="table-wrap">
-              <table>
+              <table class="admin-pending-table">
                 <thead>
                   <tr>
                     <th>Name</th><th>Login</th><th>Email</th><th>Requested</th><th>Action</th>
                   </tr>
                 </thead>
-                <tbody id="admin-pending-body"><tr><td colspan="5">Loading pending requests...</td></tr></tbody>
+                <tbody id="admin-pending-body"><tr class="admin-empty-row"><td colspan="5">Loading pending requests...</td></tr></tbody>
               </table>
             </div>
           </section>
+          <section class="panel admin-ticker-panel">
+            <div class="insight-section-head">
+              <h2>NSE Master</h2>
+              <div class="actions-row">
+                <button id="admin-nse-import" type="button" class="mini ghost">Upload NSE Master</button>
+                <input id="admin-nse-file" type="file" accept=".csv" hidden />
+              </div>
+            </div>
+            <div class="tiny-label">
+              NSE master rows: ${(state.nseMaster || []).length}
+            </div>
+          </section>
+        </section>
+
+        <section class="panel admin-ticker-requests">
+          <div class="insight-section-head">
+            <h2>Ticker Requests</h2>
+            <span class="tiny-label">Approve to add to registry and auto-fix past trades.</span>
+          </div>
+          <div class="ticker-requests-list">
+            ${renderTickerRequests(state, session, 'admin')}
+          </div>
         </section>
 
         <section class="panel admin-system-panel">
@@ -4407,12 +4896,12 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           </div>
         </section>
 
-        <section class="panel admin-activity-panel">
-          <div class="insight-section-head">
-            <h2>Activity & Audit</h2>
-            <div class="actions-row">
-              <select id="admin-log-filter">
-                <option value="all">All</option>
+          <section class="panel admin-activity-panel">
+            <div class="insight-section-head">
+              <h2>Activity & Audit</h2>
+              <div class="actions-row">
+                <select id="admin-log-filter">
+                  <option value="all">All</option>
                 <option value="auth">Auth</option>
                 <option value="cloud">Cloud</option>
                 <option value="trade">Trades</option>
@@ -4424,6 +4913,7 @@ function renderPageContent(view: AppView, session: UserSession, state: AppState)
           <ul id="admin-log-list" class="cloud-activity"></ul>
         </section>
       </section>
+      ${renderTickerRequestModal(state)}
     `;
   }
 
@@ -4465,7 +4955,7 @@ function renderWorkspace(
   view: AppView,
   message = ''
 ): void {
-  const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices);
+  const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices);
   const snapshot = dashboardFromState(state);
   const effectiveView = view === 'admin' && session.role !== 'ADMIN' ? 'dashboard' : view;
   const viewKey = effectiveView;
@@ -4519,7 +5009,16 @@ function renderWorkspace(
             </svg>
           </button>
           <button id="mobile-logo-btn" type="button" class="mobile-logo-btn">${APP_NAME}</button>
-          <button id="mobile-profile-btn" type="button" class="mobile-icon-btn" aria-label="Profile">${session.name.slice(0, 1).toUpperCase()}</button>
+          <div class="mobile-header-actions">
+            <button id="mobile-info-btn" type="button" class="mobile-icon-btn" aria-label="Info">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M12 10.5v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <circle cx="12" cy="7.5" r="1" fill="currentColor"/>
+              </svg>
+            </button>
+            <button id="mobile-profile-btn" type="button" class="mobile-icon-btn" aria-label="Profile">${session.name.slice(0, 1).toUpperCase()}</button>
+          </div>
         </header>
         <header class="topbar">
           <div class="topbar-title">
@@ -4646,6 +5145,9 @@ function renderWorkspace(
               </button>
             </div>
           </div>
+          <div class="actions-row">
+            <button id="mobile-logout-btn" type="button" class="ghost mini">Logout</button>
+          </div>
         </div>
       </div>
         <nav class="mobile-bottom-nav">
@@ -4673,6 +5175,15 @@ function renderWorkspace(
             </span>
             <span class="nav-label">Holdings</span>
           </a>
+          <a class="${view === 'pnl' ? 'active' : ''}" href="${pagePath('pnl')}" aria-label="Profit and Loss">
+            <span class="nav-icon-wrap">
+              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 16h5l2-4 3 6 2-3h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 19h16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="nav-label">P/L</span>
+          </a>
           <a class="${view === 'insights' ? 'active' : ''}" href="${pagePath('insights')}" aria-label="Insights">
             <span class="nav-icon-wrap">
               <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -4681,14 +5192,6 @@ function renderWorkspace(
             </span>
             <span class="nav-label">Insights</span>
           </a>
-          <button id="mobile-more-btn" type="button" aria-label="More">
-            <span class="nav-icon-wrap">
-              <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M6 12h.01M12 12h.01M18 12h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              </svg>
-            </span>
-            <span class="nav-label">More</span>
-          </button>
         </nav>
       </section>
 
@@ -4710,6 +5213,37 @@ function renderWorkspace(
           </nav>
         </div>
       </div>
+      <div id="mobile-info-panel" class="mobile-info-panel" aria-hidden="true">
+        <div class="mobile-info-card">
+          <div class="mobile-info-head">
+            <strong>Account & Sync</strong>
+            <button id="mobile-info-close" type="button" class="ghost mini">Close</button>
+          </div>
+          <section class="mobile-info-section">
+            <div class="account-head">
+              <div class="avatar">${session.name.slice(0, 1).toUpperCase()}</div>
+              <div>
+                <h3>${session.name}</h3>
+                <span class="account-role">${session.role}</span>
+              </div>
+            </div>
+            <div class="account-meta">
+              <div><span>Live Price Sync</span><strong data-live-sync-countdown>--</strong></div>
+              <div><span>Last Sync</span><strong>${state.lastLiveSyncAt ? new Date(state.lastLiveSyncAt).toLocaleTimeString() : 'Never'}</strong></div>
+              <div><span>Last Cloud Sync</span><strong>${state.lastSyncedAt ? new Date(state.lastSyncedAt).toLocaleTimeString() : 'Never'}</strong></div>
+              <div><span>Next Cloud Sync</span><strong class="countdown-pulse" data-cloud-sync-countdown>--</strong></div>
+            </div>
+            <button id="mobile-info-sync-btn" type="button" class="mini">Sync Live Prices</button>
+          </section>
+          <section class="mobile-info-section">
+            <h3>Quick Stats</h3>
+            <div class="progress-row"><span>Holdings</span><strong>${holdings.length}</strong></div>
+            <div class="progress-row"><span>Trades</span><strong>${snapshot.tradeCount}</strong></div>
+            <div class="progress-row"><span>Live Tickers</span><strong>${Object.keys(state.livePrices).length}</strong></div>
+            <div class="progress-row"><span>Win Rate</span><strong>${snapshot.winRate.toFixed(0)}%</strong></div>
+          </section>
+        </div>
+      </div>
     </main>
   `;
 
@@ -4729,38 +5263,75 @@ function renderWorkspace(
     showToast('Logged out', 'info');
     bootstrapApp(root);
   });
-  const isMobile = window.matchMedia('(max-width: 768px)').matches;
-  if (isMobile) {
-    const drawer = root.querySelector<HTMLElement>('#mobile-drawer');
-    let lastDrawerTrigger: HTMLElement | null = null;
-    drawer?.setAttribute('inert', '');
-    const openDrawer = (): void => {
-      if (!drawer) return;
-      drawer.classList.add('open');
-      drawer.removeAttribute('inert');
-      drawer.setAttribute('aria-hidden', 'false');
-    };
-    const closeDrawer = (): void => {
-      if (!drawer) return;
-      if (drawer.contains(document.activeElement)) {
-        (lastDrawerTrigger ?? root.querySelector<HTMLElement>('#mobile-menu-btn') ?? document.body).focus();
-      }
-      drawer.classList.remove('open');
-      drawer.setAttribute('aria-hidden', 'true');
-      drawer.setAttribute('inert', '');
-    };
-    const handleOpenDrawer = (event: Event): void => {
-      lastDrawerTrigger = event.currentTarget as HTMLElement | null;
-      openDrawer();
-    };
-    root.querySelector<HTMLButtonElement>('#mobile-menu-btn')?.addEventListener('click', handleOpenDrawer);
-    root.querySelector<HTMLButtonElement>('#mobile-more-btn')?.addEventListener('click', handleOpenDrawer);
-    root.querySelector<HTMLButtonElement>('#mobile-drawer-close')?.addEventListener('click', closeDrawer);
-    drawer?.addEventListener('click', (event) => {
-      if (event.target === drawer) closeDrawer();
-    });
+  root.querySelector<HTMLButtonElement>('#mobile-logout-btn')?.addEventListener('click', () => {
+    addActivityLog('auth', 'Logout');
+    logout();
+    showToast('Logged out', 'info');
+    bootstrapApp(root);
+  });
 
-  }
+  const mediaQuery = window.matchMedia('(max-width: 768px)');
+  const handleMobileChange = (e: MediaQueryListEvent | MediaQueryList) => {
+    if (e.matches) {
+      const drawer = root.querySelector<HTMLElement>('#mobile-drawer');
+      const infoPanel = root.querySelector<HTMLElement>('#mobile-info-panel');
+      let lastDrawerTrigger: HTMLElement | null = null;
+      let lastInfoTrigger: HTMLElement | null = null;
+      drawer?.setAttribute('inert', 'true');
+      infoPanel?.setAttribute('inert', 'true');
+      const openDrawer = (): void => {
+        if (!drawer) return;
+        drawer.classList.add('open');
+        drawer.removeAttribute('inert');
+        drawer.setAttribute('aria-hidden', 'false');
+      };
+      const openInfo = (): void => {
+        if (!infoPanel) return;
+        infoPanel.classList.add('open');
+        infoPanel.removeAttribute('inert');
+        infoPanel.setAttribute('aria-hidden', 'false');
+      };
+      const closeDrawer = (): void => {
+        if (!drawer) return;
+        if (drawer.contains(document.activeElement)) {
+          (lastDrawerTrigger ?? root.querySelector<HTMLElement>('#mobile-menu-btn') ?? document.body).focus();
+        }
+        drawer.classList.remove('open');
+        drawer.setAttribute('aria-hidden', 'true');
+        drawer.setAttribute('inert', 'true');
+      };
+      const closeInfo = (): void => {
+        if (!infoPanel) return;
+        if (infoPanel.contains(document.activeElement)) {
+          (lastInfoTrigger ?? root.querySelector<HTMLElement>('#mobile-info-btn') ?? document.body).focus();
+        }
+        infoPanel.classList.remove('open');
+        infoPanel.setAttribute('aria-hidden', 'true');
+        infoPanel.setAttribute('inert', 'true');
+      };
+      const handleOpenDrawer = (event: Event): void => {
+        lastDrawerTrigger = event.currentTarget as HTMLElement | null;
+        openDrawer();
+      };
+      const handleOpenInfo = (event: Event): void => {
+        lastInfoTrigger = event.currentTarget as HTMLElement | null;
+        openInfo();
+      };
+      root.querySelector<HTMLButtonElement>('#mobile-menu-btn')?.addEventListener('click', handleOpenDrawer);
+      root.querySelector<HTMLButtonElement>('#mobile-more-btn')?.addEventListener('click', handleOpenDrawer);
+      root.querySelector<HTMLButtonElement>('#mobile-drawer-close')?.addEventListener('click', closeDrawer);
+      root.querySelector<HTMLButtonElement>('#mobile-info-btn')?.addEventListener('click', handleOpenInfo);
+      root.querySelector<HTMLButtonElement>('#mobile-info-close')?.addEventListener('click', closeInfo);
+      drawer?.addEventListener('click', (event) => {
+        if (event.target === drawer) closeDrawer();
+      });
+      infoPanel?.addEventListener('click', (event) => {
+        if (event.target === infoPanel) closeInfo();
+      });
+    }
+  };
+  mediaQuery.addEventListener('change', handleMobileChange);
+  handleMobileChange(mediaQuery);
 
   const profileBtn = root.querySelector<HTMLButtonElement>('#profile-menu-btn');
   const profileMenu = root.querySelector<HTMLDivElement>('#profile-menu');
@@ -4842,6 +5413,7 @@ function renderWorkspace(
   });
   logoBtn?.addEventListener('click', handleOpenUiModal);
   root.querySelector<HTMLButtonElement>('#mobile-profile-btn')?.addEventListener('click', handleOpenUiModal);
+  root.querySelector<HTMLButtonElement>('#mobile-ui-btn')?.addEventListener('click', handleOpenUiModal);
   uiCloseBtn?.addEventListener('click', closeUiModal);
   uiModal?.addEventListener('click', (event) => {
     if (event.target === uiModal) closeUiModal();
@@ -4883,7 +5455,7 @@ function renderWorkspace(
 
       const trendRange = getTrendRange();
       const trendDays = trendRange === '7D' ? 7 : trendRange === '14D' ? 14 : 30;
-      const holdings = calculateHoldings(state.transactions, state.stockMappings, state.livePrices)
+      const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices)
         .filter((h) => Number(h.quantity || 0) > 0);
       if (!holdings.length) {
         if (dailyNode) dailyNode.innerHTML = '<div class="muted">No holdings yet.</div>';
@@ -5034,19 +5606,19 @@ function renderWorkspace(
     const maxSnapshotsInput = root.querySelector<HTMLInputElement>('#admin-max-snapshots');
 
     const renderUserRows = (rows: AdminUserRow[]): string => {
-      if (!rows.length) return '<tr><td colspan="6">No users found.</td></tr>';
+      if (!rows.length) return '<tr class="admin-empty-row"><td colspan="6">No users found.</td></tr>';
       return rows
         .map((row) => {
           const roleLabel = row.role === 'ADMIN' ? 'ADMIN' : 'USER';
           const statusLabel = row.status === 'DISABLED' ? 'Disabled' : 'Active';
           return `
             <tr data-user="${esc(row.userId)}">
-              <td>${esc(row.name)}</td>
-              <td>${esc(row.loginId)}</td>
-              <td>${roleLabel}</td>
-              <td>${statusLabel}</td>
-              <td>${esc(row.createdAt || '')}</td>
-              <td>
+              <td data-label="Name">${esc(row.name)}</td>
+              <td data-label="Login">${esc(row.loginId)}</td>
+              <td data-label="Role">${roleLabel}</td>
+              <td data-label="Status">${statusLabel}</td>
+              <td data-label="Created">${esc(row.createdAt || '')}</td>
+              <td data-label="Action">
                 <button class="mini" data-admin-action="toggle-role" data-user="${esc(row.userId)}">${roleLabel === 'ADMIN' ? 'Make User' : 'Make Admin'}</button>
                 <button class="mini ghost" data-admin-action="toggle-status" data-user="${esc(row.userId)}">${statusLabel === 'Active' ? 'Disable' : 'Activate'}</button>
               </td>
@@ -5057,16 +5629,16 @@ function renderWorkspace(
     };
 
     const renderPendingRows = (rows: PendingRequest[]): string => {
-      if (!rows.length) return '<tr><td colspan="5">No pending requests.</td></tr>';
+      if (!rows.length) return '<tr class="admin-empty-row"><td colspan="5">No pending requests.</td></tr>';
       return rows
         .map(
           (row) => `
           <tr>
-            <td>${esc(row.name)}</td>
-            <td>${esc(row.loginId)}</td>
-            <td>${esc(row.email || '')}</td>
-            <td>${esc(row.requestedAt)}</td>
-            <td>
+            <td data-label="Name">${esc(row.name)}</td>
+            <td data-label="Login">${esc(row.loginId)}</td>
+            <td data-label="Email">${esc(row.email || '')}</td>
+            <td data-label="Requested">${esc(row.requestedAt)}</td>
+            <td data-label="Action">
               <button class="mini" data-pending-action="approve" data-id="${esc(row.requestId)}">Approve</button>
               <button class="mini ghost" data-pending-action="reject" data-id="${esc(row.requestId)}">Reject</button>
             </td>
@@ -5205,6 +5777,83 @@ function renderWorkspace(
       }
     });
 
+    setupTickerRequestModalHandlers();
+
+    root.querySelector<HTMLFormElement>('#admin-ticker-form')?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget as HTMLFormElement;
+      const data = new FormData(form);
+      const ticker = String(data.get('ticker') || '').trim().toUpperCase();
+      const synonyms = String(data.get('synonyms') || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+      if (!ticker) {
+        showToast('Ticker is required.', 'error');
+        return;
+      }
+      try {
+        const registry = await upsertTickerRegistryRemote(session, ticker, synonyms);
+        const next = { ...state, tickerRegistry: registry };
+        addActivityLog('mapping', `Ticker added: ${ticker}`);
+        renderWorkspace(root, session, next, view, `Ticker added: ${ticker}`);
+      } catch (error) {
+        showToast('Failed to add ticker', 'error');
+      }
+    });
+
+    // Registry editing handlers removed (NSE master + requests only).
+
+    // NSE master upload handled below.
+
+    root.querySelector<HTMLButtonElement>('#admin-nse-import')?.addEventListener('click', () => {
+      root.querySelector<HTMLInputElement>('#admin-nse-file')?.click();
+    });
+
+    root.querySelector<HTMLInputElement>('#admin-nse-file')?.addEventListener('change', async (event) => {
+      const input = event.currentTarget as HTMLInputElement;
+      const file = input.files && input.files.length ? input.files[0] : null;
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const lines = text.split(/\r?\n/).filter((line) => line.trim());
+        if (lines.length < 2) {
+          showToast('NSE file is empty.', 'error');
+          return;
+        }
+        const header = parseCsvLine(lines[0]).map((h) => h.toUpperCase());
+        const symbolIdx = header.findIndex((h) => h.includes('SYMBOL'));
+        const nameIdx = header.findIndex((h) => h.includes('NAME'));
+        const isinIdx = header.findIndex((h) => h.includes('ISIN'));
+        if (symbolIdx === -1 || nameIdx === -1 || isinIdx === -1) {
+          showToast('NSE CSV missing SYMBOL, NAME, or ISIN columns.', 'error');
+          return;
+        }
+        const rows = lines
+          .slice(1)
+          .map(parseCsvLine)
+          .map((cols) => ({
+            symbol: String(cols[symbolIdx] || '').trim().toUpperCase(),
+            name: String(cols[nameIdx] || '').trim(),
+            isin: String(cols[isinIdx] || '').trim().toUpperCase()
+          }))
+          .filter((row) => row.symbol && row.name);
+        if (!rows.length) {
+          showToast('No valid NSE rows found.', 'error');
+          return;
+        }
+        const registry = await replaceNseMaster(session, rows);
+        const next = { ...state, nseMaster: registry };
+        addActivityLog('mapping', `NSE master uploaded: ${rows.length} rows`);
+        renderWorkspace(root, session, next, view, `NSE master updated (${rows.length} rows)`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to upload NSE master';
+        showToast(message, 'error');
+      } finally {
+        input.value = '';
+      }
+    });
+
     root.querySelector<HTMLButtonElement>('#admin-save-config')?.addEventListener('click', async () => {
       const value = Number(maxSnapshotsInput?.value || 10);
       showBlockingLoader('Saving admin config...');
@@ -5308,7 +5957,19 @@ function renderWorkspace(
     showBlockingLoader('Syncing live prices...');
     try {
       showToast('Live price sync started...', 'info');
-      const mappings = state.stockMappings.length ? state.stockMappings : ensureDefaultMappings(state).stockMappings;
+      const baseMappings = getCanonicalMappings(state);
+      const holdings = calculateHoldings(state.transactions, getExpandedMappings(state), state.livePrices);
+      const holdingTickers = holdings
+        .map((row) => String(row.ticker || row.stock || '').trim().toUpperCase())
+        .filter(Boolean);
+      const tickerSet = new Set(baseMappings.map((row) => row.ticker));
+      const merged = baseMappings.slice();
+      holdingTickers.forEach((ticker) => {
+        if (tickerSet.has(ticker)) return;
+        tickerSet.add(ticker);
+        merged.push({ stock: ticker, ticker, enabled: true, updatedAt: new Date().toISOString() });
+      });
+      const mappings = merged;
       const live = await syncLivePrices(mappings);
       if (live.success <= 0) {
         const failedPreview = live.failedTickers
@@ -5355,7 +6016,124 @@ function renderWorkspace(
     }
   };
 
+  const setupTickerRequestModalHandlers = (): void => {
+    const modal = root.querySelector<HTMLElement>('#ticker-approve-modal');
+    if (!modal) return;
+    const form = modal.querySelector<HTMLFormElement>('#ticker-approve-form');
+    const closeBtn = modal.querySelector<HTMLButtonElement>('#close-ticker-approve-btn');
+    const rejectBtn = modal.querySelector<HTMLButtonElement>('#ticker-reject-btn');
+    const rawInput = modal.querySelector<HTMLInputElement>('input[name="rawSymbol"]');
+    const suggestedInput = modal.querySelector<HTMLInputElement>('input[name="suggestedSymbol"]');
+    const resolvedInput = modal.querySelector<HTMLInputElement>('input[name="resolvedSymbol"]');
+    const noteInput = modal.querySelector<HTMLInputElement>('input[name="rejectNote"]');
+    const idInput = modal.querySelector<HTMLInputElement>('input[name="requestId"]');
+
+    const openModal = (requestId: string, mode: 'approve' | 'reject'): void => {
+      const request = (state.tickerRequests || []).find((req) => req.id === requestId);
+      if (!request || !idInput || !rawInput || !suggestedInput || !resolvedInput) return;
+      const suggested =
+        (resolveTickerFromRegistry(state, request.rawSymbol) || resolveTickerFromNseMaster(state, request.rawSymbol))
+          ?.ticker || '';
+      modal.dataset.mode = mode;
+      idInput.value = requestId;
+      rawInput.value = request.rawSymbol || '';
+      suggestedInput.value = suggested;
+      resolvedInput.value = request.resolvedTicker || suggested || '';
+      if (noteInput) noteInput.value = '';
+      modal.classList.add('open');
+      modal.setAttribute('aria-hidden', 'false');
+      resolvedInput.focus();
+    };
+
+    const closeModal = (): void => {
+      modal.classList.remove('open');
+      modal.setAttribute('aria-hidden', 'true');
+    };
+
+    root.querySelectorAll<HTMLButtonElement>('button[data-request-approve]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const requestId = String(btn.dataset.requestApprove || '').trim();
+        if (!requestId) return;
+        openModal(requestId, 'approve');
+      });
+    });
+
+    root.querySelectorAll<HTMLButtonElement>('button[data-request-reject]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const requestId = String(btn.dataset.requestReject || '').trim();
+        if (!requestId) return;
+        openModal(requestId, 'reject');
+      });
+    });
+
+    closeBtn?.addEventListener('click', closeModal);
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) closeModal();
+    });
+
+    form?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const requestId = String(idInput?.value || '').trim();
+      const resolved = String(resolvedInput?.value || '').trim().toUpperCase();
+      if (!requestId) return;
+      if (!resolved || !isValidTickerFormat(resolved)) {
+        showToast('Enter a valid ticker symbol to approve.', 'error');
+        return;
+      }
+      showBlockingLoader('Approving ticker...');
+      try {
+        await approveTickerRequestRemote(session, requestId, resolved);
+        let next = await refreshTickerData(session, state);
+        let updatedMessage = `Ticker request approved: ${resolved}`;
+        try {
+          const mappings = getCanonicalMappings(next);
+          const live = await syncLivePrices(mappings);
+          const normalizedPrices: typeof live.prices = {};
+          Object.entries(live.prices || {}).forEach(([ticker, row]) => {
+            normalizedPrices[String(ticker || '').trim().toUpperCase()] = row;
+          });
+          next = {
+            ...next,
+            livePrices: { ...next.livePrices, ...normalizedPrices },
+            lastLiveSyncAt: live.success ? new Date().toISOString() : next.lastLiveSyncAt
+          };
+          if (live.success) updatedMessage += ` | Live prices updated (${live.success})`;
+        } catch {
+          // live sync failures should not block approval
+        }
+        addActivityLog('mapping', `Ticker request approved: ${resolved}`);
+        renderWorkspace(root, session, next, view, updatedMessage);
+      } catch (error) {
+        showToast('Failed to approve ticker request', 'error');
+      } finally {
+        hideBlockingLoader();
+        closeModal();
+      }
+    });
+
+    rejectBtn?.addEventListener('click', async () => {
+      const requestId = String(idInput?.value || '').trim();
+      if (!requestId) return;
+      const note = String(noteInput?.value || '').trim();
+      showBlockingLoader('Rejecting ticker...');
+      try {
+        await rejectTickerRequestRemote(session, requestId, note);
+        const next = await refreshTickerData(session, state);
+        addActivityLog('mapping', `Ticker request rejected: ${requestId}`);
+        renderWorkspace(root, session, next, view, `Ticker request rejected`);
+      } catch (error) {
+        showToast('Failed to reject ticker request', 'error');
+      } finally {
+        hideBlockingLoader();
+        closeModal();
+      }
+    });
+  };
+
   root.querySelector<HTMLButtonElement>('#account-sync-btn')?.addEventListener('click', () => {
+    runLiveSync();
+  });
+  root.querySelector<HTMLButtonElement>('#mobile-info-sync-btn')?.addEventListener('click', () => {
     runLiveSync();
   });
 
@@ -5426,11 +6204,12 @@ function renderWorkspace(
     const checklistTab = root.querySelector<HTMLButtonElement>('#trade-tab-checklist');
     const manualFormRef = root.querySelector<HTMLFormElement>('#manual-form');
     const fileInput = root.querySelector<HTMLInputElement>('#import-form input[name="csv"]');
+    const brokerSelect = root.querySelector<HTMLSelectElement>('#import-broker');
     const textFilter = root.querySelector<HTMLInputElement>('#tx-filter-text');
     const sideFilter = root.querySelector<HTMLSelectElement>('#tx-filter-side');
     const fromFilter = root.querySelector<HTMLInputElement>('#tx-filter-from');
     const toFilter = root.querySelector<HTMLInputElement>('#tx-filter-to');
-    const mappingSection = root.querySelector<HTMLElement>('#mapping-section');
+    const requestsSection = root.querySelector<HTMLElement>('#ticker-requests');
 
     const openTradeModal = (mode: 'add' | 'edit'): void => {
       if (!modal) return;
@@ -5475,8 +6254,8 @@ function renderWorkspace(
       if (manualFormRef) {
         const editIdField = manualFormRef.elements.namedItem('editId') as HTMLInputElement | null;
         if (editIdField) editIdField.value = '';
-        const dateField = manualFormRef.elements.namedItem('tradeDate') as HTMLInputElement | null;
-        if (dateField) dateField.value = formatDateDDMMYYYY(new Date());
+        const dateField = manualFormRef.elements.namedItem('tradeDateTime') as HTMLInputElement | null;
+        if (dateField) dateField.value = toIsoDateTimeLocal(new Date());
       }
       showTradePanel('details');
       openTradeModal('add');
@@ -5492,8 +6271,8 @@ function renderWorkspace(
     root.querySelector<HTMLButtonElement>('#import-cta-btn')?.addEventListener('click', () => {
       fileInput?.click();
     });
-    root.querySelector<HTMLButtonElement>('#jump-mapping-btn')?.addEventListener('click', () => {
-      mappingSection?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    root.querySelector<HTMLButtonElement>('#jump-requests-btn')?.addEventListener('click', () => {
+      requestsSection?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     });
     textFilter?.addEventListener('input', applyTxnFilters);
     sideFilter?.addEventListener('change', applyTxnFilters);
@@ -5533,7 +6312,8 @@ function renderWorkspace(
     applyTxnFilters();
 
     const runImport = async (file: File | null): Promise<void> => {
-      const broker = 'Imported';
+      const brokerRaw = String(brokerSelect?.value || 'AUTO').trim();
+      const broker = brokerRaw === 'AUTO' ? 'Imported' : brokerRaw.replace(/_/g, ' ');
 
       if (!file) {
         renderWorkspace(root, session, state, view, 'File is required');
@@ -5544,24 +6324,55 @@ function renderWorkspace(
       try {
         const ok = await confirmPopup(`Import ${file.name}?`, 'Import Trades');
         if (!ok) return;
+        const baseState = await refreshTickerData(session, state);
         const result = await importBrokerageFile(file, broker);
+        const totalRows = result.accepted.length + result.rejected.length;
+        const unmatched = new Set<string>();
         const normalizedImport = result.accepted.map((txn) => {
           const feesFromFile = Number(txn.fees || 0);
           const fees =
             Number.isFinite(feesFromFile) && feesFromFile > 0
               ? feesFromFile
-              : computeTxnFees(txn.side, txn.quantity, txn.price, state.settings);
-          return { ...txn, fees };
+              : computeTxnFees(txn.side, txn.quantity, txn.price, baseState.settings);
+          const rawSymbol = String(txn.symbol || '').trim().toUpperCase();
+          const resolved =
+            resolveTickerFromRegistry(baseState, rawSymbol) || resolveTickerFromNseMaster(baseState, rawSymbol);
+          if (!resolved) {
+            if (rawSymbol) unmatched.add(rawSymbol);
+          }
+          const symbol = resolved ? resolved.ticker : rawSymbol;
+          const nextNote =
+            resolved && rawSymbol && rawSymbol !== resolved.ticker
+              ? [txn.note, `Raw: ${rawSymbol}`].filter(Boolean).join(' | ')
+              : txn.note;
+          return { ...txn, fees, symbol, note: nextNote };
         });
-        const deduped = dedupeImportedTransactions(state.transactions, normalizedImport);
-        const filtered = filterImportImpossibleSells(state.transactions, deduped.accepted);
-        const nextState = appendTransactions(session, state, filtered.accepted);
+        const deduped = dedupeImportedTransactions(baseState.transactions, normalizedImport);
+        const filtered = filterImportImpossibleSells(baseState.transactions, deduped.accepted);
+        let nextState = appendTransactions(session, baseState, filtered.accepted);
+        if (unmatched.size) {
+          await submitTickerRequests(session, Array.from(unmatched.values()));
+          nextState = await refreshTickerData(session, nextState);
+        }
+        const reasonCounts = result.rejected.reduce<Record<string, number>>((acc, row) => {
+          acc[row.reason] = (acc[row.reason] || 0) + 1;
+          return acc;
+        }, {});
+        const topReasons = Object.entries(reasonCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([reason, count]) => `${reason} (${count})`)
+          .join('; ');
         renderWorkspace(
           root,
           session,
           ensureDefaultMappings(nextState),
           view,
-          `Imported ${filtered.accepted.length} row(s), rejected ${result.rejected.length}, duplicates skipped ${deduped.duplicatesSkipped}, invalid SELL skipped ${filtered.skippedImpossible}`
+          `Total ${totalRows} | Imported ${filtered.accepted.length} | Rejected ${result.rejected.length}${
+            topReasons ? ` (${topReasons})` : ''
+          } | Duplicates skipped ${deduped.duplicatesSkipped} | Invalid SELL skipped ${filtered.skippedImpossible}${
+            unmatched.size ? ` | Ticker requests ${unmatched.size}` : ''
+          }`
         );
       } finally {
         hideBlockingLoader();
@@ -5577,51 +6388,7 @@ function renderWorkspace(
     root.querySelector<HTMLButtonElement>('#sync-live-btn')?.addEventListener('click', () => {
       runLiveSync();
     });
-
-    root.querySelector<HTMLFormElement>('#mapping-form')?.addEventListener('submit', (event) => {
-      event.preventDefault();
-      const form = event.currentTarget as HTMLFormElement;
-      const data = new FormData(form);
-    const stock = String(data.get('stock') || '').trim().toUpperCase();
-    const tickerInput = String(data.get('ticker') || '').trim().toUpperCase();
-    const ticker = tickerInput || stock;
-      if (!stock || !ticker) {
-        renderWorkspace(root, session, state, view, 'Stock and ticker are required');
-        return;
-      }
-
-    const next = upsertStockMapping(session, state, stock, ticker);
-    addActivityLog('mapping', `Mapping saved: ${stock} -> ${ticker}`);
-    renderWorkspace(root, session, next, view, `Mapping saved: ${stock} -> ${ticker}`);
-  });
-
-    root.querySelectorAll<HTMLButtonElement>('button[data-edit-mapping]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const stock = String(btn.dataset.editMapping || '').trim();
-        const mapping = state.stockMappings.find((m) => m.stock === stock);
-        const form = root.querySelector<HTMLFormElement>('#mapping-form');
-        if (!mapping || !form) return;
-        (form.elements.namedItem('stock') as HTMLInputElement).value = mapping.stock;
-        (form.elements.namedItem('ticker') as HTMLInputElement).value = mapping.ticker;
-        form.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
-    });
-
-    root.querySelectorAll<HTMLButtonElement>('button[data-del-mapping]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const stock = String(btn.dataset.delMapping || '').trim();
-        if (!stock) return;
-        const ok = await confirmPopup(`Delete mapping for ${stock}?`, 'Delete Mapping');
-        if (!ok) return;
-        const next = deleteStockMapping(session, state, stock);
-        addActivityLog('mapping', `Mapping deleted: ${stock}`);
-        renderWorkspace(root, session, next, view, `Mapping deleted: ${stock}`);
-      });
-    });
-
-    if (window.location.hash === '#mapping') {
-      mappingSection?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
+    setupTickerRequestModalHandlers();
 
     root.querySelector<HTMLButtonElement>('#run-checklist-btn')?.addEventListener('click', () => {
       const output = root.querySelector<HTMLDivElement>('#checklist-output');
@@ -5670,24 +6437,27 @@ function renderWorkspace(
       `;
     });
 
-    root.querySelector<HTMLFormElement>('#manual-form')?.addEventListener('submit', (event) => {
+    root.querySelector<HTMLFormElement>('#manual-form')?.addEventListener('submit', async (event) => {
       event.preventDefault();
       const form = event.currentTarget as HTMLFormElement;
       const data = new FormData(form);
 
       const editId = String(data.get('editId') || '').trim();
-      const tradeDateText = String(data.get('tradeDate') || '').trim();
-      const tradeDate = parseDateDDMMYYYY(tradeDateText);
+      const tradeDateTimeRaw = String(data.get('tradeDateTime') || '').trim();
+      const tradeDateTime = parseDateTimeLocal(tradeDateTimeRaw);
+      const tradeDate = tradeDateTime ? toIsoDate(tradeDateTime) : '';
       const broker = 'Manual';
-      const symbol = String(data.get('symbol') || '').trim().toUpperCase();
+      const rawSymbol = String(data.get('symbol') || '').trim().toUpperCase();
+      const resolvedSymbol = resolveTickerFromRegistry(state, rawSymbol) || resolveTickerFromNseMaster(state, rawSymbol);
+      const symbol = resolvedSymbol ? resolvedSymbol.ticker : rawSymbol;
       const side = String(data.get('side') || '').trim().toUpperCase();
       const quantity = Number(data.get('quantity') || 0);
       const price = Number(data.get('price') || 0);
       const note = String(data.get('note') || '').trim();
       const enforceChecklist = String(data.get('enforceChecklist') || '') === 'on';
 
-      if (!tradeDate || !symbol || (side !== 'BUY' && side !== 'SELL')) {
-        renderWorkspace(root, session, state, view, 'Manual entry: required fields missing (date format DD-MM-YYYY)');
+      if (!tradeDateTime || !rawSymbol || (side !== 'BUY' && side !== 'SELL')) {
+        renderWorkspace(root, session, state, view, 'Manual entry: required fields missing (date/time or symbol)');
         return;
       }
       if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price) || price <= 0) {
@@ -5731,19 +6501,31 @@ function renderWorkspace(
         id: editId || crypto.randomUUID(),
         importedAt: new Date().toISOString(),
         tradeDate,
+        tradeDateTime: tradeDateTime.toISOString(),
         broker,
         symbol,
         side: side as 'BUY' | 'SELL',
         quantity,
         price,
         fees: computeTxnFees(side as 'BUY' | 'SELL', quantity, price, state.settings),
-        note: [note, checklistNote].filter(Boolean).join(' | ')
+        note: [
+          note,
+          checklistNote,
+          resolvedSymbol && rawSymbol && rawSymbol !== resolvedSymbol.ticker ? `Raw: ${rawSymbol}` : ''
+        ]
+          .filter(Boolean)
+          .join(' | ')
       };
 
-      const next = upsertTransaction(session, state, txn);
-      const msg = editId
-        ? `Transaction updated${checklistNote.includes('FAIL') ? ' (checklist warning)' : ''}`
-        : `Transaction added${checklistNote.includes('FAIL') ? ' (checklist warning)' : ''}`;
+      let next = upsertTransaction(session, state, txn);
+      if (!resolvedSymbol && rawSymbol) {
+        await submitTickerRequests(session, [rawSymbol]);
+        next = await refreshTickerData(session, next);
+      }
+      const msgBase = editId ? 'Transaction updated' : 'Transaction added';
+      const msg = `${msgBase}${checklistNote.includes('FAIL') ? ' (checklist warning)' : ''}${
+        !resolvedSymbol && rawSymbol ? ' | Ticker request sent' : ''
+      }`;
       addActivityLog('trade', `${editId ? 'Edited' : 'Added'} trade ${side} ${symbol}`);
       renderWorkspace(root, session, next, view, msg);
     });
@@ -5759,7 +6541,12 @@ function renderWorkspace(
           if (input) input.value = value;
         };
         set('editId', txn.id);
-        set('tradeDate', formatDateFromISOToDDMM(txn.tradeDate));
+        const dtValue = txn.tradeDateTime
+          ? toIsoDateTimeLocal(new Date(txn.tradeDateTime))
+          : txn.tradeDate
+            ? `${txn.tradeDate}T09:15`
+            : toIsoDateTimeLocal(new Date());
+        set('tradeDateTime', dtValue);
         set('symbol', txn.symbol);
         set('side', txn.side);
         set('quantity', String(txn.quantity));
@@ -5797,6 +6584,9 @@ function renderWorkspace(
     const holdGrid = root.querySelector<HTMLElement>('#holdings-cards-grid');
     const holdSort = root.querySelector<HTMLSelectElement>('#hold-sort');
     const holdSearch = root.querySelector<HTMLInputElement>('#hold-search');
+    const holdTickerSearch = root.querySelector<HTMLInputElement>('#holding-ticker-search');
+    const holdTickerSort = root.querySelector<HTMLSelectElement>('#holding-ticker-sort');
+    const holdTickerTable = root.querySelector<HTMLElement>('#holding-ticker-table');
 
     const applyHoldingsFilters = (): void => {
       if (!holdGrid) return;
@@ -5833,6 +6623,31 @@ function renderWorkspace(
       visible.forEach((card) => holdGrid.appendChild(card));
     };
 
+    const applyHoldingTickerFilters = (): void => {
+      if (!holdTickerTable) return;
+      const query = String(holdTickerSearch?.value || '').trim().toUpperCase();
+      const sortMode = String(holdTickerSort?.value || 'az');
+      const rows = Array.from(holdTickerTable.querySelectorAll<HTMLElement>('.ticker-row[data-ticker]'));
+      rows.forEach((row) => {
+        const ticker = String(row.dataset.ticker || '').toUpperCase();
+        row.style.display = !query || ticker.includes(query) ? '' : 'none';
+      });
+      const visible = rows.filter((row) => row.style.display !== 'none');
+      visible.sort((a, b) => {
+        const tA = String(a.dataset.ticker || '');
+        const tB = String(b.dataset.ticker || '');
+        const ltpA = Number(a.dataset.ltp || 0);
+        const ltpB = Number(b.dataset.ltp || 0);
+        const chA = Number(a.dataset.change || 0);
+        const chB = Number(b.dataset.change || 0);
+        if (sortMode === 'za') return tB.localeCompare(tA);
+        if (sortMode === 'ltp') return ltpB - ltpA;
+        if (sortMode === 'change') return chB - chA;
+        return tA.localeCompare(tB);
+      });
+      visible.forEach((row) => holdTickerTable.appendChild(row));
+    };
+
     root.querySelectorAll<HTMLButtonElement>('[data-hold-filter]').forEach((btn) => {
       btn.addEventListener('click', () => {
         root.querySelectorAll<HTMLButtonElement>('[data-hold-filter]').forEach((b) => {
@@ -5846,12 +6661,15 @@ function renderWorkspace(
     });
     holdSort?.addEventListener('change', applyHoldingsFilters);
     holdSearch?.addEventListener('input', applyHoldingsFilters);
+    holdTickerSearch?.addEventListener('input', applyHoldingTickerFilters);
+    holdTickerSort?.addEventListener('change', applyHoldingTickerFilters);
     const globalSearch = String(localStorage.getItem('fds_global_search') || '').trim();
     if (holdSearch && globalSearch.toLowerCase().startsWith('holding ')) {
       holdSearch.value = globalSearch.slice(8).trim().toUpperCase();
       localStorage.removeItem('fds_global_search');
     }
     applyHoldingsFilters();
+    applyHoldingTickerFilters();
 
     root.querySelector<HTMLButtonElement>('#sync-live-btn')?.addEventListener('click', () => {
       runLiveSync();
@@ -6706,55 +7524,61 @@ function renderWorkspace(
       }
     });
 
-    root.querySelector<HTMLButtonElement>('#export-csv-btn')?.addEventListener('click', async () => {
-      const ok = await confirmPopup('Export CSV files for expenses, debts, credits, trades, and mappings?', 'Export CSV');
+    root.querySelector<HTMLButtonElement>('#export-excel-btn')?.addEventListener('click', async () => {
+      const ok = await confirmPopup('Export an Excel workbook with all datasets?', 'Export Excel');
       if (!ok) return;
-      const toCsv = (rows: Record<string, unknown>[]): string => {
-        if (!rows.length) return '';
-        const headers = Object.keys(rows[0]);
-        const escCell = (v: unknown): string => {
-          const raw = String(v ?? '');
-          if (raw.includes(',') || raw.includes('"') || raw.includes('\n')) {
-            return `"${raw.replace(/\"/g, '""')}"`;
-          }
-          return raw;
-        };
-        return [headers.join(','), ...rows.map((r) => headers.map((h) => escCell(r[h])).join(','))].join('\n');
-      };
+      const XLSX = (await import('xlsx')) as typeof import('xlsx');
+      const wb = XLSX.utils.book_new();
       const datasets: Array<{ name: string; rows: Record<string, unknown>[] }> = [
         { name: 'expenses', rows: state.expenses as unknown as Record<string, unknown>[] },
         { name: 'debts', rows: state.debtItems as unknown as Record<string, unknown>[] },
         { name: 'credits', rows: state.creditItems as unknown as Record<string, unknown>[] },
         { name: 'trades', rows: state.transactions as unknown as Record<string, unknown>[] },
-        { name: 'mappings', rows: state.stockMappings as unknown as Record<string, unknown>[] }
+        { name: 'ticker_registry', rows: (state.tickerRegistry || []) as unknown as Record<string, unknown>[] },
+        { name: 'ticker_requests', rows: (state.tickerRequests || []) as unknown as Record<string, unknown>[] },
+        { name: 'nse_master', rows: (state.nseMaster || []) as unknown as Record<string, unknown>[] }
       ];
       datasets.forEach((set) => {
-        const csv = toCsv(set.rows);
-        const blob = new Blob([csv], { type: 'text/csv' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `fds-${set.name}-${new Date().toISOString().slice(0, 10)}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
+        const sheet = XLSX.utils.json_to_sheet(set.rows);
+        XLSX.utils.book_append_sheet(wb, sheet, set.name.slice(0, 31));
       });
-      addActivityLog('cloud', 'Snapshot exported (CSV)');
-      showToast('CSV exports generated', 'export');
+      const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `fds-export-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addActivityLog('cloud', 'Snapshot exported (Excel)');
+      showToast('Excel export generated', 'export');
     });
 
-    root.querySelector<HTMLButtonElement>('#export-pdf-btn')?.addEventListener('click', async () => {
-      const ok = await confirmPopup('Export a PDF print view of all data?', 'Export PDF');
+    root.querySelector<HTMLButtonElement>('#export-word-btn')?.addEventListener('click', async () => {
+      const ok = await confirmPopup('Export a Word document with all datasets?', 'Export Word');
       if (!ok) return;
-      const win = window.open('', '_blank');
-      if (!win) return;
-      win.document.write(`<pre>${esc(JSON.stringify(state, null, 2))}</pre>`);
-      win.document.close();
-      win.focus();
-      win.print();
-      addActivityLog('cloud', 'Snapshot exported (PDF print)');
-      showToast('PDF export opened', 'export');
+      const docContent = `
+        <html>
+          <head><meta charset="utf-8" /></head>
+          <body>
+            <h1>Finance Decision System Export</h1>
+            <pre>${esc(JSON.stringify(state, null, 2))}</pre>
+          </body>
+        </html>
+      `;
+      const blob = new Blob([docContent], { type: 'application/msword' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `fds-export-${new Date().toISOString().slice(0, 10)}.doc`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addActivityLog('cloud', 'Snapshot exported (Word)');
+      showToast('Word export generated', 'export');
     });
 
     const logType = root.querySelector<HTMLSelectElement>('#cloud-log-type');
@@ -6842,4 +7666,12 @@ export function bootstrapApp(root: HTMLElement, forcedView?: AppView): void {
   const view = forcedView || getInitialView();
   saveView(view);
   renderWorkspace(root, session, state, view);
+  void (async () => {
+    const next = await refreshTickerData(session, state);
+    const registryChanged = (next.tickerRegistry || []).length !== (state.tickerRegistry || []).length;
+    const requestsChanged = (next.tickerRequests || []).length !== (state.tickerRequests || []).length;
+    if (registryChanged || requestsChanged) {
+      renderWorkspace(root, session, next, view);
+    }
+  })();
 }

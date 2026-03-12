@@ -5,7 +5,7 @@ import type { CsvImportResult, TradeSide, Transaction } from './types';
 type ParsedTable = { headers: string[]; body: string[][] };
 
 function normalizeHeader(value: string): string {
-  return String(value || '')
+  return String(value ?? '')
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
@@ -22,6 +22,8 @@ function parseSide(value: string): TradeSide | null {
   const normalized = String(value || '').trim().toUpperCase();
   if (normalized === 'BUY' || normalized === 'B') return 'BUY';
   if (normalized === 'SELL' || normalized === 'S') return 'SELL';
+  if (normalized.startsWith('BUY')) return 'BUY';
+  if (normalized.startsWith('SELL')) return 'SELL';
   return null;
 }
 
@@ -93,7 +95,12 @@ function normalizeSymbol(value: string): string {
 
 function detectFlatTrade(headers: string[]): boolean {
   const has = (options: string[]) => indexOf(headers, options) >= 0;
-  return has(['scrip', 'stock', 'security']) && has(['date', 'trade_date']) && has(['bqty', 'buy_qty']) && has(['sqty', 'sell_qty']);
+  return (
+    has(['scrip', 'stock', 'security']) &&
+    has(['date', 'trade_date']) &&
+    has(['bqty', 'b_qty', 'buy_qty', 'b_qty', 'b_qty']) &&
+    has(['sqty', 's_qty', 'sell_qty', 's_qty'])
+  );
 }
 
 function parseFlatTradeStock(value: string): string {
@@ -107,19 +114,41 @@ function parseFlatTradeRows(parsed: ParsedTable, broker: string): CsvImportResul
   const rejected: { row: number; reason: string }[] = [];
 
   const dateIdx = indexOf(parsed.headers, ['date', 'trade_date']);
-  const stockIdx = indexOf(parsed.headers, ['scrip', 'stock', 'security', 'company']);
+  const stockIdx = indexOf(parsed.headers, ['scrip', 'stock', 'security']);
+  const companyIdx = indexOf(parsed.headers, ['company']);
   const bQtyIdx = indexOf(parsed.headers, ['bqty', 'b_qty', 'buy_qty']);
-  const bRateIdx = indexOf(parsed.headers, ['bnrate', 'b_n_rate', 'buy_rate', 'buy_price']);
+  const bRateIdx = indexOf(parsed.headers, [
+    'bnrate',
+    'b_n_rate',
+    'b_gr_rate',
+    'bgrrate',
+    'buy_rate',
+    'buy_price',
+    'buy_price_per_unit'
+  ]);
   const sQtyIdx = indexOf(parsed.headers, ['sqty', 's_qty', 'sell_qty']);
-  const sRateIdx = indexOf(parsed.headers, ['snrate', 's_n_rate', 'sell_rate', 'sell_price']);
+  const sRateIdx = indexOf(parsed.headers, [
+    'snrate',
+    's_n_rate',
+    's_gr_rate',
+    'sgrrate',
+    'sell_rate',
+    'sell_price',
+    'sell_price_per_unit'
+  ]);
 
   parsed.body.forEach((row, index) => {
     const line = index + 2;
+    const rowTexts = row.map((cell) => String(cell ?? '').trim());
     const tradeDate = toDate(row[dateIdx]);
-    const symbol = parseFlatTradeStock(row[stockIdx]);
+    const stockCell = stockIdx >= 0 ? row[stockIdx] : '';
+    const companyCell = companyIdx >= 0 ? row[companyIdx] : '';
+    const rawSymbol = String(stockCell || '').trim() || String(companyCell || '').trim();
+    const symbol = parseFlatTradeStock(rawSymbol);
 
+    const hasAnyQty = rowTexts.some((cell) => Number.isFinite(toNumber(cell)) && toNumber(cell) !== 0);
     if (!tradeDate || !symbol) {
-      rejected.push({ row: line, reason: 'Invalid date or symbol' });
+      if (hasAnyQty) rejected.push({ row: line, reason: 'Invalid date or symbol' });
       return;
     }
 
@@ -128,7 +157,10 @@ function parseFlatTradeRows(parsed: ParsedTable, broker: string): CsvImportResul
     const sQty = toNumber(row[sQtyIdx]);
     const sRate = toNumber(row[sRateIdx]);
 
-    if (Number.isFinite(bQty) && bQty > 0 && Number.isFinite(bRate) && bRate > 0) {
+    const hasBuy = Number.isFinite(bQty) && bQty > 0 && Number.isFinite(bRate) && bRate > 0;
+    const hasSell = Number.isFinite(sQty) && sQty > 0 && Number.isFinite(sRate) && sRate > 0;
+
+    if (hasBuy) {
       accepted.push({
         id: crypto.randomUUID(),
         importedAt: new Date().toISOString(),
@@ -143,7 +175,7 @@ function parseFlatTradeRows(parsed: ParsedTable, broker: string): CsvImportResul
       });
     }
 
-    if (Number.isFinite(sQty) && sQty > 0 && Number.isFinite(sRate) && sRate > 0) {
+    if (hasSell) {
       accepted.push({
         id: crypto.randomUUID(),
         importedAt: new Date().toISOString(),
@@ -158,8 +190,8 @@ function parseFlatTradeRows(parsed: ParsedTable, broker: string): CsvImportResul
       });
     }
 
-    if (!(Number.isFinite(bQty) && bQty > 0) && !(Number.isFinite(sQty) && sQty > 0)) {
-      rejected.push({ row: line, reason: 'No valid buy/sell quantity found' });
+    if (!hasBuy && !hasSell && hasAnyQty) {
+      rejected.push({ row: line, reason: 'No valid buy/sell quantity or price found' });
     }
   });
 
@@ -170,14 +202,76 @@ function parseGenericRows(parsed: ParsedTable, broker: string): CsvImportResult 
   const accepted: Transaction[] = [];
   const rejected: { row: number; reason: string }[] = [];
 
-  const dateIndex = indexOf(parsed.headers, ['date', 'trade_date', 'trade_date_time', 'timestamp', 'order_execution_time']);
-  const dateTimeIndex = indexOf(parsed.headers, ['trade_date_time', 'timestamp', 'order_execution_time', 'time']);
-  const symbolIndex = indexOf(parsed.headers, ['symbol', 'ticker', 'security', 'stock', 'scrip', 'company']);
-  const sideIndex = indexOf(parsed.headers, ['side', 'type', 'action', 'trade_type']);
-  const quantityIndex = indexOf(parsed.headers, ['quantity', 'qty', 'units', 'filled_quantity']);
-  const priceIndex = indexOf(parsed.headers, ['price', 'avg_price', 'trade_price', 'execution_price', 'average_price']);
-  const feeIndex = indexOf(parsed.headers, ['fees', 'fee', 'charges', 'brokerage', 'total_charges']);
-  const orderIdIndex = indexOf(parsed.headers, ['order_id', 'orderid', 'exchange_order_id', 'order_number', 'order_no']);
+  const dateIndex = indexOf(parsed.headers, [
+    'date',
+    'trade_date',
+    'trade_date_time',
+    'timestamp',
+    'order_execution_time',
+    'order_time',
+    'exchange_timestamp'
+  ]);
+  const dateTimeIndex = indexOf(parsed.headers, [
+    'trade_date_time',
+    'timestamp',
+    'order_execution_time',
+    'order_time',
+    'exchange_timestamp',
+    'time'
+  ]);
+  const symbolIndex = indexOf(parsed.headers, [
+    'symbol',
+    'ticker',
+    'security',
+    'stock',
+    'scrip',
+    'company',
+    'tradingsymbol',
+    'trading_symbol',
+    'instrument'
+  ]);
+  const sideIndex = indexOf(parsed.headers, [
+    'side',
+    'type',
+    'action',
+    'trade_type',
+    'transaction_type',
+    'buy_sell',
+    'buy/sell'
+  ]);
+  const quantityIndex = indexOf(parsed.headers, [
+    'quantity',
+    'qty',
+    'units',
+    'filled_quantity',
+    'filled_qty',
+    'executed_qty',
+    'trade_qty'
+  ]);
+  const priceIndex = indexOf(parsed.headers, [
+    'price',
+    'avg_price',
+    'trade_price',
+    'execution_price',
+    'average_price',
+    'net_price',
+    'rate'
+  ]);
+  const feeIndex = indexOf(parsed.headers, [
+    'fees',
+    'fee',
+    'charges',
+    'brokerage',
+    'total_charges',
+    'tax'
+  ]);
+  const orderIdIndex = indexOf(parsed.headers, [
+    'order_id',
+    'orderid',
+    'exchange_order_id',
+    'order_number',
+    'order_no'
+  ]);
   const tradeIdIndex = indexOf(parsed.headers, ['trade_id', 'tradeid', 'fill_id', 'execution_id']);
 
   if ([dateIndex, symbolIndex, sideIndex, quantityIndex, priceIndex].some((v) => v < 0)) {
@@ -365,19 +459,29 @@ export async function importBrokerageFile(file: File, broker: string): Promise<C
     const ab = await file.arrayBuffer();
     const wb = XLSX.read(ab, { type: 'array' });
 
-    let best: CsvImportResult | null = null;
+    const combined: CsvImportResult = { accepted: [], rejected: [] };
     for (const sheetName of wb.SheetNames) {
       const ws = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' }) as unknown[][];
       const parsed = parseExcelRows(rows.map((r) => r.map((c) => String(c ?? ''))));
       const result = parseTable(parsed, broker);
-      if (!best || result.accepted.length > best.accepted.length) {
-        best = result;
+      if (result.accepted.length) {
+        combined.accepted.push(...result.accepted);
+      }
+      if (result.rejected.length) {
+        combined.rejected.push(
+          ...result.rejected.map((row) => ({
+            row: row.row,
+            reason: `Sheet ${sheetName}: ${row.reason}`
+          }))
+        );
       }
     }
 
-    if (!best) return { accepted: [], rejected: [{ row: 1, reason: 'No readable data in workbook' }] };
-    return best;
+    if (!combined.accepted.length && !combined.rejected.length) {
+      return { accepted: [], rejected: [{ row: 1, reason: 'No readable data in workbook' }] };
+    }
+    return combined;
   }
 
   return { accepted: [], rejected: [{ row: 1, reason: 'Unsupported file type. Use CSV, TXT, XLSX, or XLS.' }] };
