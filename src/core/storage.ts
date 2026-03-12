@@ -7,7 +7,6 @@ import type {
   StockMapping,
   TickerRegistryItem,
   TickerRequest,
-  NseMasterItem,
   TickerAliasGroup,
   Transaction,
   UserSession
@@ -324,7 +323,7 @@ export function resolveTickerRequest(
   const requests = Array.isArray(currentState.tickerRequests) ? currentState.tickerRequests.slice() : [];
   const request = requests.find((req) => req.id === requestId);
   if (!request || request.status !== 'PENDING') return currentState;
-  const updatedRequests = requests.map((req) =>
+  const updatedRequests: TickerRequest[] = requests.map((req) =>
     req.id === requestId
       ? {
           ...req,
@@ -335,7 +334,7 @@ export function resolveTickerRequest(
         }
       : req
   );
-  let nextState = { ...currentState, tickerRequests: updatedRequests };
+  let nextState: AppState = { ...currentState, tickerRequests: updatedRequests };
   nextState = applyTickerResolution(nextState, request.rawSymbol, tickerKey);
   nextState = upsertTickerRegistry(session, nextState, tickerKey, [request.rawSymbol]);
   return nextState;
@@ -348,7 +347,7 @@ export function rejectTickerRequest(
   note = ''
 ): AppState {
   const requests = Array.isArray(currentState.tickerRequests) ? currentState.tickerRequests.slice() : [];
-  const updatedRequests = requests.map((req) =>
+  const updatedRequests: TickerRequest[] = requests.map((req) =>
     req.id === requestId
       ? {
           ...req,

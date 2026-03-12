@@ -54,7 +54,15 @@ import {
   writeState
 } from '../core/storage';
 import { pullFromCloud, pushToCloud, trimSnapshots } from '../core/sync';
-import type { AppState, HoldingRow, StockMapping, UserRole, UserSession } from '../core/types';
+import type {
+  AppState,
+  HoldingRow,
+  NseMasterItem,
+  StockMapping,
+  TickerRegistryItem,
+  UserRole,
+  UserSession
+} from '../core/types';
 
 export type AppView =
   | 'dashboard'
@@ -512,7 +520,7 @@ function resolveTickerFromRegistry(
 ): { ticker: string; score: number; matchedBy: string } | null {
   const raw = String(symbol || '').trim().toUpperCase();
   if (!raw) return null;
-  const registry = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
+  const registry: TickerRegistryItem[] = Array.isArray(state.tickerRegistry) ? state.tickerRegistry : [];
   if (!registry.length) {
     const mapping = state.stockMappings.find((row) => String(row.stock || '').trim().toUpperCase() === raw);
     if (mapping) {
@@ -565,7 +573,7 @@ function resolveTickerFromNseMaster(
 ): { ticker: string; score: number; matchedBy: string } | null {
   const raw = String(symbol || '').trim().toUpperCase();
   if (!raw) return null;
-  const nseMaster = Array.isArray(state.nseMaster) ? state.nseMaster : [];
+  const nseMaster: NseMasterItem[] = Array.isArray(state.nseMaster) ? state.nseMaster : [];
   if (!nseMaster.length) return null;
   const rawTokens = tokenizeCompanyText(raw);
   const rawCompact = normalizeCompanyText(raw).replaceAll(' ', '');
@@ -3271,17 +3279,6 @@ function formatDateDDMMYYYY(date: Date): string {
   return `${d}-${m}-${y}`;
 }
 
-function parseDateDDMMYYYY(value: string): string {
-  const raw = String(value || '').trim();
-  const m = raw.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
-  if (!m) return '';
-  const d = Number(m[1]);
-  const mm = Number(m[2]);
-  const y = Number(m[3]);
-  if (!d || !mm || !y) return '';
-  return `${String(y).padStart(4, '0')}-${String(mm).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-}
-
 function formatDateFromISOToDDMM(isoDate: string): string {
   const dt = new Date(isoDate);
   if (Number.isNaN(dt.getTime())) return isoDate;
@@ -5779,29 +5776,6 @@ function renderWorkspace(
 
     setupTickerRequestModalHandlers();
 
-    root.querySelector<HTMLFormElement>('#admin-ticker-form')?.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const form = event.currentTarget as HTMLFormElement;
-      const data = new FormData(form);
-      const ticker = String(data.get('ticker') || '').trim().toUpperCase();
-      const synonyms = String(data.get('synonyms') || '')
-        .split(',')
-        .map((item) => item.trim())
-        .filter(Boolean);
-      if (!ticker) {
-        showToast('Ticker is required.', 'error');
-        return;
-      }
-      try {
-        const registry = await upsertTickerRegistryRemote(session, ticker, synonyms);
-        const next = { ...state, tickerRegistry: registry };
-        addActivityLog('mapping', `Ticker added: ${ticker}`);
-        renderWorkspace(root, session, next, view, `Ticker added: ${ticker}`);
-      } catch (error) {
-        showToast('Failed to add ticker', 'error');
-      }
-    });
-
     // Registry editing handlers removed (NSE master + requests only).
 
     // NSE master upload handled below.
@@ -6016,7 +5990,7 @@ function renderWorkspace(
     }
   };
 
-  const setupTickerRequestModalHandlers = (): void => {
+  function setupTickerRequestModalHandlers(): void {
     const modal = root.querySelector<HTMLElement>('#ticker-approve-modal');
     if (!modal) return;
     const form = modal.querySelector<HTMLFormElement>('#ticker-approve-form');
@@ -6128,7 +6102,7 @@ function renderWorkspace(
         closeModal();
       }
     });
-  };
+  }
 
   root.querySelector<HTMLButtonElement>('#account-sync-btn')?.addEventListener('click', () => {
     runLiveSync();
